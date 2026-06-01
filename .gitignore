@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.ko
+*.mod.c
+*.mod
+*.order
+*.symvers
+.*.cmd
+build-output/
+gki-kernel-headers/
+android-kernel/
+prebuilts/
+.ccache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup
+*.bak
+*.backup

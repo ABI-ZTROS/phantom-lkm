@@ -1,0 +1,382 @@
+# =============================================================================
+# build-phantom-lkm.yml
+# =============================================================================
+# Build OnePlus ACE5 (SM8650) phantom_lkm Kernel Module (.ko)
+# Target: Android GKI 6.1 ARM64
+#
+# Triggers:
+#   - Push to master/main branch (when source files change)
+#   - Manual workflow_dispatch with configurable parameters
+#   - Tag push (v*) for automatic release creation
+# =============================================================================
+
+name: Build phantom_lkm (SM8650)
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+    paths:
+      - '*.c'
+      - '*.h'
+      - 'Makefile'
+      - '.github/workflows/build-phantom-lkm.yml'
+      - '.github/workflows/update-kernel-headers.yml'
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'GKI kernel version manifest branch'
+        required: false
+        default: 'common-android14-6.1-lts'
+        type: choice
+        options:
+          - 'common-android14-6.1-lts'
+          - 'common-android14-6.1'
+          - 'common-android15-6.6-lts'
+          - 'common-android15-6.6'
+      clang_version:
+        description: 'Clang toolchain version'
+        required: false
+        default: 'clang-r536225'
+        type: choice
+        options:
+          - 'clang-r536225'
+          - 'clang-r530567'
+          - 'clang-r522817'
+          - 'clang-r510928'
+      debug_level:
+        description: 'Module debug level (0=none, 1=basic, 2=verbose)'
+        required: false
+        default: '0'
+        type: choice
+        options: ['0', '1', '2']
+      create_release:
+        description: 'Create GitHub Release with artifacts'
+        required: false
+        default: false
+        type: boolean
+      skip_cache:
+        description: 'Skip cache and force re-download dependencies'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_version || 'common-android14-6.1-lts' }}
+  CLANG_VERSION: ${{ inputs.clang_version || 'clang-r536225' }}
+  DEBUG_LEVEL: ${{ inputs.debug_level || '0' }}
+  MODULE_NAME: phantom_lkm
+  OUTPUT_DIR: build-output
+  HEADERS_DIR: gki-kernel-headers
+  CLANG_DIR: prebuilts/clang/host/linux-x86
+
+jobs:
+  build-module:
+    name: Build phantom_lkm.ko (SM8650)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    outputs:
+      build_success: ${{ steps.build.outputs.build_success }}
+      module_path: ${{ steps.build.outputs.module_path }}
+      kernel_branch: ${{ env.KERNEL_MANIFEST_BRANCH }}
+      clang_version: ${{ env.CLANG_VERSION }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify source files
+        id: verify-source
+        run: |
+          echo "=== Verifying source files ==="
+          if [ ! -f "${{ github.workspace }}/phantom_lkm.c" ]; then
+            echo "ERROR: phantom_lkm.c not found!"
+            ls -la ${{ github.workspace }}/
+            exit 1
+          fi
+          if [ ! -f "${{ github.workspace }}/Makefile" ]; then
+            echo "ERROR: Makefile not found!"
+            exit 1
+          fi
+          echo "Source files verified:"
+          ls -la ${{ github.workspace }}/*.{c,h,Makefile} 2>/dev/null
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison curl flex git \
+            libelf-dev libssl-dev openssl \
+            python3 rsync unzip wget xz-utils \
+            zlib1g-dev file ccache
+
+      - name: Cache Clang/LLVM toolchain
+        if: ${{ inputs.skip_cache != true }}
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.CLANG_DIR }}
+          key: clang-toolchain-${{ env.CLANG_VERSION }}-${{ runner.os }}
+          restore-keys: |
+            clang-toolchain-${{ env.CLANG_VERSION }}-
+
+      - name: Download Android Clang toolchain
+        if: steps.cache-clang.outputs.cache-hit != 'true' || inputs.skip_cache == true
+        timeout-minutes: 15
+        run: |
+          set -euxo pipefail
+          CLANG_PATH="${{ github.workspace }}/${{ env.CLANG_DIR }}"
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
+          
+          echo "=== Downloading Clang ${{ env.CLANG_VERSION }} ==="
+          mkdir -p "$CLANG_PATH"
+          rm -rf "${CLANG_PATH:?}/${{ env.CLANG_VERSION }}"
+          
+          git clone --depth=1 --single-branch \
+            --branch "${{ env.CLANG_VERSION }}" \
+            "${CLANG_URL}" "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
+          
+          echo "Clang downloaded:"
+          ls "${CLANG_PATH}/${{ env.CLANG_VERSION }}/bin/" | head -10
+
+      - name: Verify Clang installation
+        run: |
+          CLANG_BIN="${{ github.workspace }}/${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}/bin"
+          if [ ! -f "${CLANG_BIN}/clang" ]; then
+            echo "ERROR: clang not found at ${CLANG_BIN}/clang"
+            exit 1
+          fi
+          "${CLANG_BIN}/clang" --version | head -3
+          echo "CLANG_PATH=${{ github.workspace }}/${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}" >> "${GITHUB_ENV}"
+          echo "CLANG_BIN=${CLANG_BIN}" >> "${GITHUB_ENV}"
+          echo "PATH=${CLANG_BIN}:${PATH}" >> "${GITHUB_ENV}"
+
+      - name: Cache GKI kernel headers
+        if: ${{ inputs.skip_cache != true }}
+        id: cache-headers
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}
+          key: gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-${{ hashFiles('Makefile') }}-${{ runner.os }}
+          restore-keys: |
+            gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-
+
+      - name: Install repo tool
+        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
+        run: |
+          mkdir -p "${{ github.workspace }}/bin"
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "${{ github.workspace }}/bin/repo"
+          chmod +x "${{ github.workspace }}/bin/repo"
+          echo "${{ github.workspace }}/bin" >> "${GITHUB_PATH}"
+
+      - name: Download GKI kernel source
+        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
+        timeout-minutes: 30
+        run: |
+          set -euxo pipefail
+          rm -rf "${{ github.workspace }}/android-kernel"
+          mkdir -p "${{ github.workspace }}/android-kernel"
+          cd "${{ github.workspace }}/android-kernel"
+          
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${{ env.KERNEL_MANIFEST_BRANCH }}" \
+            --depth=1
+          
+          repo sync -c -j"$(nproc --all)" --fail-fast --no-tags --force-sync --current-branch
+
+      - name: Extract kernel headers
+        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
+        run: |
+          set -euxo pipefail
+          KERNEL_SRC="${{ github.workspace }}/android-kernel/common"
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          
+          if [ ! -d "$KERNEL_SRC" ]; then
+            echo "ERROR: Kernel source not found at $KERNEL_SRC"
+            ls -la "${{ github.workspace }}/android-kernel/" || true
+            exit 1
+          fi
+          
+          rm -rf "$HEADERS_PATH"
+          mkdir -p "$HEADERS_PATH"
+          
+          rsync -a --delete \
+            --include='Makefile' --include='Kconfig' --include='Kbuild' \
+            --include='arch/' --include='arch/arm64/' --include='arch/arm64/**' \
+            --include='include/' --include='include/**' \
+            --include='scripts/' --include='scripts/**' \
+            --include='tools/objtool/' --include='tools/objtool/**' \
+            --include='Module.symvers' \
+            --exclude='*.o' --exclude='*.ko' --exclude='*.mod.c' \
+            --exclude='.git' \
+            "$KERNEL_SRC/" "$HEADERS_PATH/"
+          
+          mkdir -p "$HEADERS_PATH/out"
+          [ ! -f "$HEADERS_PATH/Module.symvers" ] && touch "$HEADERS_PATH/Module.symvers"
+          
+          echo "Headers extracted: $(du -sh "$HEADERS_PATH" | cut -f1)"
+
+      - name: Verify kernel headers integrity
+        run: |
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          MISSING=0
+          for f in Makefile arch/arm64/Makefile include/linux/module.h include/linux/kernel.h scripts/Makefile.modpost; do
+            if [ ! -f "$HEADERS_PATH/$f" ]; then
+              echo "ERROR: Missing $f"
+              MISSING=$((MISSING + 1))
+            else
+              echo "OK: $f"
+            fi
+          done
+          [ $MISSING -gt 0 ] && { echo "ERROR: $MISSING files missing!"; exit 1; }
+          echo "Headers integrity check passed"
+
+      - name: Build phantom_lkm.ko
+        id: build
+        run: |
+          set -exuo pipefail
+          
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          CLANG_BIN="${{ env.CLANG_BIN }}"
+          SRC_PATH="${{ github.workspace }}"
+          OUTPUT_PATH="${{ github.workspace }}/${{ env.OUTPUT_DIR }}"
+          
+          mkdir -p "$OUTPUT_PATH"
+          
+          make -C "$SRC_PATH" \
+            KDIR="$HEADERS_PATH" \
+            ARCH=arm64 \
+            CROSS_COMPILE="${CLANG_BIN}/aarch64-linux-gnu-" \
+            CC="${CLANG_BIN}/clang" \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            LD="${CLANG_BIN}/ld.lld" \
+            AR="${CLANG_BIN}/llvm-ar" \
+            NM="${CLANG_BIN}/llvm-nm" \
+            OBJCOPY="${CLANG_BIN}/llvm-objcopy" \
+            STRIP="${CLANG_BIN}/llvm-strip" \
+            DEBUG_LEVEL="${{ env.DEBUG_LEVEL }}" \
+            V=1 \
+            2>&1 | tee "${OUTPUT_PATH}/build.log"
+          
+          BUILD_EXIT_CODE=${PIPESTATUS[0]}
+          
+          if [ $BUILD_EXIT_CODE -eq 0 ] && [ -f "${SRC_PATH}/phantom_lkm.ko" ]; then
+            echo "build_success=true" >> "${GITHUB_OUTPUT}"
+            echo "module_path=${SRC_PATH}/phantom_lkm.ko" >> "${GITHUB_OUTPUT}"
+            cp "${SRC_PATH}/phantom_lkm.ko" "${OUTPUT_PATH}/"
+            echo "=== Build successful ==="
+            ls -lh "${OUTPUT_PATH}/phantom_lkm.ko"
+          else
+            echo "build_success=false" >> "${GITHUB_OUTPUT}"
+            echo "ERROR: Build failed with exit code $BUILD_EXIT_CODE"
+            exit 1
+          fi
+
+      - name: Verify module format (ARM64)
+        if: success()
+        run: |
+          MODULE_FILE="${{ github.workspace }}/${{ env.OUTPUT_DIR }}/phantom_lkm.ko"
+          echo "=== Verifying module format ==="
+          file "$MODULE_FILE"
+          FILE_INFO=$(file "$MODULE_FILE")
+          echo "$FILE_INFO" | grep -q "ARM aarch64" || { echo "ERROR: Not ARM64!"; exit 1; }
+          echo "Module format verified: ARM64 relocatable"
+
+      - name: Output error log on failure
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          echo "=========================================="
+          echo "  BUILD FAILED - Diagnostic Information"
+          echo "=========================================="
+          OUTPUT_PATH="${{ github.workspace }}/${{ env.OUTPUT_DIR }}"
+          [ -f "${OUTPUT_PATH}/build.log" ] && tail -150 "${OUTPUT_PATH}/build.log"
+          echo ""
+          echo "--- Suggestions ---"
+          echo "1. Try 'skip_cache: true' to refresh dependencies"
+          echo "2. Check kernel version compatibility (6.1 GKI)"
+
+      - name: Upload phantom_lkm.ko artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom_lkm-sm8650-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/phantom_lkm.ko
+            ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Create GitHub Release
+    needs: build-module
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: |
+      always() && 
+      needs.build-module.outputs.build_success == 'true' && 
+      (startsWith(github.ref, 'refs/tags/v') || 
+       (github.event_name == 'workflow_dispatch' && inputs.create_release == true))
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phantom_lkm-sm8650-${{ github.run_id }}
+          path: ./release-artifacts
+
+      - name: Prepare release assets
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VERSION_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION_TAG="manual-$(date +%Y%m%d-%H%M%S)"
+          fi
+          cd ./release-artifacts
+          [ -f "phantom_lkm.ko" ] && mv phantom_lkm.ko "phantom_lkm-sm8650-${VERSION_TAG}.ko"
+          sha256sum *.ko > SHA256SUMS.txt
+          echo "VERSION_TAG=${VERSION_TAG}" >> "${GITHUB_ENV}"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION_TAG }}
+          name: "phantom_lkm SM8650 - ${{ env.VERSION_TAG }}"
+          body: |
+            ## OnePlus ACE5 (SM8650) phantom_lkm Kernel Module
+
+            ### Build Information
+            - **SoC**: Qualcomm SM8650 (Snapdragon 8 Gen 3)
+            - **Target Kernel**: Android GKI 6.1 (ARM64)
+            - **Kernel Branch**: `${{ needs.build-module.outputs.kernel_branch }}`
+            - **Clang**: `${{ needs.build-module.outputs.clang_version }}`
+            - **Commit**: ${{ github.sha }}
+
+            ### Installation
+            ```bash
+            adb push phantom_lkm-sm8650-*.ko /data/local/tmp/
+            adb shell su -c "insmod /data/local/tmp/phantom_lkm-sm8650-*.ko"
+            adb shell su -c "cat /sys/kernel/phantom_lkm/status"
+            ```
+
+            ### Trace Output
+            ```bash
+            adb shell su -c "cat /sys/kernel/tracing/trace | grep phantom_lkm"
+            ```
+          files: |
+            ./release-artifacts/phantom_lkm-sm8650-*.ko
+            ./release-artifacts/SHA256SUMS.txt
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

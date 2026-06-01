@@ -1,0 +1,479 @@
+# =============================================================================
+# update-kernel-headers.yml
+# =============================================================================
+# Automated GKI kernel headers update and caching workflow
+# This workflow can be triggered manually, on schedule, or called by other workflows
+#
+# Features:
+#   - Downloads and caches GKI kernel headers for specified branches
+#   - Supports workflow_call for reuse by build-phantom-lkm.yml
+#   - Scheduled weekly updates to keep headers fresh
+# =============================================================================
+
+name: Update GKI Kernel Headers
+
+on:
+  # Manual trigger with options
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'GKI kernel version manifest branch'
+        required: false
+        default: 'common-android14-6.1-lts'
+        type: choice
+        options:
+          - 'common-android14-6.1-lts'
+          - 'common-android14-6.1'
+          - 'common-android15-6.6-lts'
+          - 'common-android15-6.6'
+          - 'common-android13-5.15-lts'
+          - 'common-android13-5.15'
+      force_refresh:
+        description: 'Force refresh cache (ignore existing cache)'
+        required: false
+        default: false
+        type: boolean
+      validate_only:
+        description: 'Only validate existing cache without downloading'
+        required: false
+        default: false
+        type: boolean
+
+  # Scheduled weekly update (Sunday at 2:00 AM UTC)
+  schedule:
+    - cron: '0 2 * * 0'
+
+  # Reusable workflow call
+  workflow_call:
+    inputs:
+      kernel_version:
+        description: 'GKI kernel version manifest branch'
+        required: false
+        default: 'common-android14-6.1-lts'
+        type: string
+      force_refresh:
+        description: 'Force refresh cache'
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      cache_key:
+        description: 'The cache key used for the headers'
+        value: ${{ jobs.update-headers.outputs.cache_key }}
+      headers_path:
+        description: 'Path to the extracted headers'
+        value: ${{ jobs.update-headers.outputs.headers_path }}
+      cache_hit:
+        description: 'Whether the cache was hit'
+        value: ${{ jobs.update-headers.outputs.cache_hit }}
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_version || 'common-android14-6.1-lts' }}
+  HEADERS_DIR: gki-kernel-headers
+  FORCE_REFRESH: ${{ inputs.force_refresh || false }}
+
+jobs:
+  # ===========================================================================
+  # Job 1: Update and cache kernel headers
+  # ===========================================================================
+  update-headers:
+    name: Update GKI Kernel Headers
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    outputs:
+      cache_key: ${{ steps.cache-headers.outputs.cache_key }}
+      headers_path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}
+      cache_hit: ${{ steps.cache-headers.outputs.cache-hit }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Checkout repository (for Makefile hash)
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # -----------------------------------------------------------------------
+      # Step 2: Install dependencies
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: |
+          echo "=== Installing dependencies ==="
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            git \
+            python3 \
+            rsync \
+            wget \
+            xz-utils \
+            ca-certificates
+
+      # -----------------------------------------------------------------------
+      # Step 3: Check existing cache
+      # -----------------------------------------------------------------------
+      - name: Check existing cache
+        if: ${{ inputs.validate_only != true && inputs.force_refresh != true }}
+        id: cache-headers
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}
+          key: gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-${{ hashFiles('kernel_lkm/Makefile', 'kernel_module/Makefile') }}-${{ runner.os }}
+          restore-keys: |
+            gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-
+            gki-headers-
+
+      # -----------------------------------------------------------------------
+      # Step 4: Validate existing cache (if validate_only mode)
+      # -----------------------------------------------------------------------
+      - name: Validate existing cache
+        if: ${{ inputs.validate_only == true }}
+        run: |
+          echo "=== Validating existing cache ==="
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          
+          if [ ! -d "$HEADERS_PATH" ]; then
+            echo "ERROR: Headers directory not found at $HEADERS_PATH"
+            exit 1
+          fi
+          
+          # Check essential files
+          REQUIRED_FILES=(
+            "Makefile"
+            "arch/arm64/Makefile"
+            "include/linux/module.h"
+            "scripts/Makefile.modpost"
+          )
+          
+          MISSING=0
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$HEADERS_PATH/$file" ]; then
+              echo "MISSING: $file"
+              MISSING=$((MISSING + 1))
+            else
+              echo "OK: $file"
+            fi
+          done
+          
+          if [ $MISSING -gt 0 ]; then
+            echo "ERROR: $MISSING required files are missing!"
+            exit 1
+          fi
+          
+          echo "Cache validation passed!"
+          echo "Headers size: $(du -sh "$HEADERS_PATH" | cut -f1)"
+
+      # -----------------------------------------------------------------------
+      # Step 5: Install repo tool (if needed)
+      # -----------------------------------------------------------------------
+      - name: Install repo tool
+        if: |
+          inputs.validate_only != true && 
+          (steps.cache-headers.outputs.cache-hit != 'true' || inputs.force_refresh == true)
+        run: |
+          echo "=== Installing repo tool ==="
+          mkdir -p "${{ github.workspace }}/bin"
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "${{ github.workspace }}/bin/repo"
+          chmod +x "${{ github.workspace }}/bin/repo"
+          echo "${{ github.workspace }}/bin" >> "${GITHUB_PATH}"
+          repo --version
+
+      # -----------------------------------------------------------------------
+      # Step 6: Download GKI kernel source
+      # -----------------------------------------------------------------------
+      - name: Download GKI kernel source
+        if: |
+          inputs.validate_only != true && 
+          (steps.cache-headers.outputs.cache-hit != 'true' || inputs.force_refresh == true)
+        timeout-minutes: 30
+        run: |
+          set -euxo pipefail
+          
+          echo "=== Downloading GKI kernel source ==="
+          echo "Manifest branch: ${{ env.KERNEL_MANIFEST_BRANCH }}"
+          
+          rm -rf "${{ github.workspace }}/android-kernel"
+          mkdir -p "${{ github.workspace }}/android-kernel"
+          cd "${{ github.workspace }}/android-kernel"
+          
+          # Initialize repo
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${{ env.KERNEL_MANIFEST_BRANCH }}" \
+            --depth=1
+          
+          # Sync kernel source
+          repo sync \
+            -c \
+            -j"$(nproc --all)" \
+            --fail-fast \
+            --no-tags \
+            --force-sync \
+            --no-clone-bundle \
+            --optimized-fetch \
+            --prune \
+            --current-branch
+          
+          echo "Kernel source synced successfully"
+
+      # -----------------------------------------------------------------------
+      # Step 7: Extract kernel headers
+      # -----------------------------------------------------------------------
+      - name: Extract kernel headers
+        if: |
+          inputs.validate_only != true && 
+          (steps.cache-headers.outputs.cache-hit != 'true' || inputs.force_refresh == true)
+        run: |
+          set -euxo pipefail
+          
+          KERNEL_SRC="${{ github.workspace }}/android-kernel/common"
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          
+          echo "=== Extracting kernel headers ==="
+          
+          if [ ! -d "$KERNEL_SRC" ]; then
+            echo "ERROR: Kernel source not found at $KERNEL_SRC"
+            ls -la "${{ github.workspace }}/android-kernel/" || true
+            exit 1
+          fi
+          
+          rm -rf "$HEADERS_PATH"
+          mkdir -p "$HEADERS_PATH"
+          
+          # Copy essential headers
+          echo "Copying kernel headers..."
+          rsync -a --delete \
+            --include='Makefile' \
+            --include='Kconfig' \
+            --include='Kbuild' \
+            --include='arch/' \
+            --include='arch/arm64/' \
+            --include='arch/arm64/include/' \
+            --include='arch/arm64/include/**' \
+            --include='arch/arm64/lib/' \
+            --include='arch/arm64/lib/**' \
+            --include='arch/arm64/Makefile' \
+            --include='arch/arm64/kernel/' \
+            --include='arch/arm64/kernel/asm-offsets.s' \
+            --include='arch/arm64/tools/' \
+            --include='arch/arm64/tools/**' \
+            --include='include/' \
+            --include='include/**' \
+            --include='scripts/' \
+            --include='scripts/**' \
+            --include='tools/' \
+            --include='tools/objtool/' \
+            --include='tools/objtool/**' \
+            --include='Module.symvers' \
+            --exclude='*.o' \
+            --exclude='*.cmd' \
+            --exclude='*.ko' \
+            --exclude='*.mod' \
+            --exclude='*.mod.c' \
+            --exclude='*.order' \
+            --exclude='.git' \
+            --exclude='.tmp_*' \
+            "$KERNEL_SRC/" "$HEADERS_PATH/"
+          
+          # Create output directory
+          mkdir -p "$HEADERS_PATH/out"
+          
+          # Create Module.symvers if not present
+          if [ ! -f "$HEADERS_PATH/Module.symvers" ]; then
+            touch "$HEADERS_PATH/Module.symvers"
+          fi
+          
+          echo "Headers extracted successfully"
+          echo "Size: $(du -sh "$HEADERS_PATH" | cut -f1)"
+
+      # -----------------------------------------------------------------------
+      # Step 8: Verify headers integrity
+      # -----------------------------------------------------------------------
+      - name: Verify headers integrity
+        if: inputs.validate_only != true
+        run: |
+          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          
+          echo "=== Verifying headers integrity ==="
+          
+          REQUIRED_FILES=(
+            "Makefile"
+            "arch/arm64/Makefile"
+            "arch/arm64/include/asm/types.h"
+            "include/linux/module.h"
+            "include/linux/kernel.h"
+            "scripts/Makefile.modpost"
+          )
+          
+          MISSING=0
+          for file in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$HEADERS_PATH/$file" ]; then
+              echo "ERROR: Missing: $file"
+              MISSING=$((MISSING + 1))
+            fi
+          done
+          
+          if [ $MISSING -gt 0 ]; then
+            echo "ERROR: $MISSING files missing!"
+            exit 1
+          fi
+          
+          echo "Verification passed!"
+          echo "Headers location: $HEADERS_PATH"
+          echo "Headers size: $(du -sh "$HEADERS_PATH" | cut -f1)"
+
+      # -----------------------------------------------------------------------
+      # Step 9: Save cache (force refresh mode)
+      # -----------------------------------------------------------------------
+      - name: Save cache (force refresh)
+        if: inputs.validate_only != true && inputs.force_refresh == true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}
+          key: gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-${{ hashFiles('kernel_lkm/Makefile', 'kernel_module/Makefile') }}-${{ runner.os }}-${{ github.run_id }}
+
+      # -----------------------------------------------------------------------
+      # Step 10: Output summary
+      # -----------------------------------------------------------------------
+      - name: Output summary
+        run: |
+          echo "=== Update Summary ==="
+          echo "Kernel branch: ${{ env.KERNEL_MANIFEST_BRANCH }}"
+          echo "Cache hit: ${{ steps.cache-headers.outputs.cache-hit || 'N/A (force refresh)' }}"
+          echo "Headers path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}"
+          
+          if [ -d "${{ github.workspace }}/${{ env.HEADERS_DIR }}" ]; then
+            echo "Headers size: $(du -sh ${{ github.workspace }}/${{ env.HEADERS_DIR }} | cut -f1)"
+          fi
+
+  # ===========================================================================
+  # Job 2: Update multiple kernel versions (matrix build)
+  # ===========================================================================
+  update-all-versions:
+    name: Update All Kernel Versions
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.kernel_version == 'all')
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        kernel_version:
+          - 'common-android14-6.1-lts'
+          - 'common-android14-6.1'
+          - 'common-android15-6.6-lts'
+          - 'common-android15-6.6'
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git python3 rsync wget xz-utils
+
+      - name: Install repo tool
+        run: |
+          mkdir -p "${{ github.workspace }}/bin"
+          curl -sL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "${{ github.workspace }}/bin/repo"
+          chmod +x "${{ github.workspace }}/bin/repo"
+          echo "${{ github.workspace }}/bin" >> "${GITHUB_PATH}"
+
+      - name: Download and cache headers for ${{ matrix.kernel_version }}
+        timeout-minutes: 30
+        run: |
+          set -euxo pipefail
+          
+          echo "=== Processing ${{ matrix.kernel_version }} ==="
+          
+          rm -rf "${{ github.workspace }}/android-kernel"
+          mkdir -p "${{ github.workspace }}/android-kernel"
+          cd "${{ github.workspace }}/android-kernel"
+          
+          repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${{ matrix.kernel_version }}" \
+            --depth=1
+          
+          repo sync \
+            -c \
+            -j"$(nproc --all)" \
+            --fail-fast \
+            --no-tags \
+            --force-sync \
+            --no-clone-bundle
+          
+          # Extract headers
+          HEADERS_PATH="${{ github.workspace }}/gki-headers-${{ matrix.kernel_version }}"
+          KERNEL_SRC="${{ github.workspace }}/android-kernel/common"
+          
+          rm -rf "$HEADERS_PATH"
+          mkdir -p "$HEADERS_PATH"
+          
+          rsync -a --delete \
+            --include='Makefile' \
+            --include='Kconfig' \
+            --include='Kbuild' \
+            --include='arch/' \
+            --include='arch/arm64/' \
+            --include='arch/arm64/include/' \
+            --include='arch/arm64/include/**' \
+            --include='arch/arm64/lib/' \
+            --include='arch/arm64/lib/**' \
+            --include='arch/arm64/Makefile' \
+            --include='arch/arm64/kernel/' \
+            --include='arch/arm64/kernel/asm-offsets.s' \
+            --include='arch/arm64/tools/' \
+            --include='arch/arm64/tools/**' \
+            --include='include/' \
+            --include='include/**' \
+            --include='scripts/' \
+            --include='scripts/**' \
+            --include='tools/' \
+            --include='tools/objtool/' \
+            --include='tools/objtool/**' \
+            --include='Module.symvers' \
+            --exclude='*.o' \
+            --exclude='*.cmd' \
+            --exclude='*.ko' \
+            --exclude='*.mod' \
+            --exclude='*.mod.c' \
+            --exclude='*.order' \
+            --exclude='.git' \
+            --exclude='.tmp_*' \
+            "$KERNEL_SRC/" "$HEADERS_PATH/"
+          
+          mkdir -p "$HEADERS_PATH/out"
+          [ ! -f "$HEADERS_PATH/Module.symvers" ] && touch "$HEADERS_PATH/Module.symvers"
+          
+          echo "Headers for ${{ matrix.kernel_version }} ready"
+          echo "Size: $(du -sh "$HEADERS_PATH" | cut -f1)"
+
+      - name: Save cache for ${{ matrix.kernel_version }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/gki-headers-${{ matrix.kernel_version }}
+          key: gki-headers-${{ matrix.kernel_version }}-${{ github.run_id }}-${{ runner.os }}
+
+  # ===========================================================================
+  # Job 3: Report status
+  # ===========================================================================
+  report:
+    name: Report Status
+    needs: [update-headers, update-all-versions]
+    runs-on: ubuntu-latest
+    if: always() && (needs.update-headers.result == 'success' || needs.update-all-versions.result == 'success')
+    steps:
+      - name: Report success
+        run: |
+          echo "=== Kernel Headers Update Complete ==="
+          echo "Update job completed successfully"
+          echo "Cached kernel versions are ready for build workflows"
