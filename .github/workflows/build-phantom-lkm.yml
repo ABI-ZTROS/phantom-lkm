@@ -162,7 +162,7 @@ jobs:
           
           repo sync -c -j"$(nproc --all)" --fail-fast --no-tags --force-sync --current-branch
 
-      - name: Extract kernel headers
+      - name: Extract and prepare kernel headers
         if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
         run: |
           set -euxo pipefail
@@ -178,19 +178,24 @@ jobs:
           rm -rf "$HEADERS_PATH"
           mkdir -p "$HEADERS_PATH"
           
+          # 复制完整内核源码（不只是 headers，需要配置文件）
           rsync -a --delete \
-            --include='Makefile' --include='Kconfig' --include='Kbuild' \
-            --include='arch/' --include='arch/arm64/' --include='arch/arm64/**' \
-            --include='include/' --include='include/**' \
-            --include='scripts/' --include='scripts/**' \
-            --include='tools/objtool/' --include='tools/objtool/**' \
-            --include='Module.symvers' \
-            --exclude='*.o' --exclude='*.ko' --exclude='*.mod.c' \
             --exclude='.git' \
+            --exclude='*.o' --exclude='*.ko' \
             "$KERNEL_SRC/" "$HEADERS_PATH/"
           
-          mkdir -p "$HEADERS_PATH/out"
+          # 生成内核配置文件（必需！）
+          cd "$HEADERS_PATH"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts || true
+          
+          # 确保 Module.symvers 存在
           [ ! -f "$HEADERS_PATH/Module.symvers" ] && touch "$HEADERS_PATH/Module.symvers"
+          
+          echo "Headers prepared:"
+          ls -la "$HEADERS_PATH/include/config/auto.conf" || echo "auto.conf not found (will be generated on first build)"
+          file "$HEADERS_PATH/scripts/mod/modpost" || echo "modpost not built"
           
           echo "Headers extracted: $(du -sh "$HEADERS_PATH" | cut -f1)"
 
