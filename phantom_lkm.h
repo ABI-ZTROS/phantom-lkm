@@ -19,8 +19,15 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/atomic.h>
-#include <linux/trace_printk.h>
 #include <linux/ktime.h>
+
+/* trace_printk 头文件（某些内核配置中不存在） */
+#if defined(CONFIG_TRACE_PRINTK) || defined(CONFIG_FTRACE)
+#include <linux/trace_printk.h>
+#else
+/* fallback: 使用 pr_debug 替代 trace_printk */
+#define trace_printk(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
+#endif
 
 /* ==================== 模块信息 ==================== */
 

@@ -25,6 +25,11 @@ ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -O2
 ccflags-y += -g  # 保留调试信息
 
+# 禁用新版 GCC 的类型比较警告（内核头文件有这些问题）
+ccflags-y += -Wno-type-limits
+ccflags-y += -Wno-sign-compare
+ccflags-y += -Wno-error  # 禁用 -Werror，避免警告变成错误
+
 # GKI合规性检查标志（可选）
 # ccflags-y += -Werror=implicit-function-declaration
 
