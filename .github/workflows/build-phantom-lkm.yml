@@ -133,15 +133,29 @@ jobs:
         run: |
           set -euxo pipefail
           CLANG_PATH="${{ github.workspace }}/${{ env.CLANG_DIR }}"
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
           
           echo "=== Downloading Clang ${{ env.CLANG_VERSION }} ==="
           mkdir -p "$CLANG_PATH"
           rm -rf "${CLANG_PATH:?}/${{ env.CLANG_VERSION }}"
           
-          git clone --depth=1 --single-branch \
-            --branch "${{ env.CLANG_VERSION }}" \
-            "${CLANG_URL}" "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
+          # AOSP Clang tarball URL (直接下载，不走 git clone)
+          # 格式: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ env.CLANG_VERSION }}.tar.gz
+          CLANG_TARBALL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ env.CLANG_VERSION }}.tar.gz"
+          
+          # 备用: AOSP CI builds
+          # CLANG_TARBALL="https://ci.android.com/builds/submitted/9750374/latest/clang/${{ env.CLANG_VERSION }}.tar.gz"
+          
+          echo "Downloading from: $CLANG_TARBALL"
+          curl -sSL "$CLANG_TARBALL" -o /tmp/clang.tar.gz || {
+            echo "Primary URL failed, trying fallback..."
+            # Fallback: 使用 AOSP 预编译镜像
+            CLANG_TARBALL="https://dl.google.com/android/repository/${{ env.CLANG_VERSION }}-linux.tar.gz"
+            curl -sSL "$CLANG_TARBALL" -o /tmp/clang.tar.gz
+          }
+          
+          mkdir -p "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
+          tar -xzf /tmp/clang.tar.gz -C "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
+          rm /tmp/clang.tar.gz
           
           echo "Clang downloaded:"
           ls "${CLANG_PATH}/${{ env.CLANG_VERSION }}/bin/" | head -10
