@@ -1,547 +1,907 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * phantom_lkm.c - 教学研究用内核模块
- * 研究链表动态摘除操作及sysfs节点注销机制
+ * phantom_lkm.c - AuroraSU VFS 内核模块
+ * 对齐 VFS_KERNEL_MODULE_SPEC.md v3.0 规范
  *
  * 目标平台: OnePlus ACE5 (SM8650), 内核 6.1.141, Android 14 GKI
  */
 
 #include "phantom_lkm.h"
 
-/* ==================== 全局状态 ==================== */
+/* ==================== 全局上下文 ==================== */
 
-static struct phantom_state g_state = {
-    .kobj = NULL,
-    .node_list = LIST_HEAD_INIT(g_state.node_list),
-    .list_mutex = __MUTEX_INITIALIZER(g_state.list_mutex),
-    .node_count = 0,
-    .initialized = false,
-};
+static struct vfs_debug_ctx g_ctx;
 
-/* ==================== 链表操作实现 ==================== */
+/* ==================== 统计计数器实现 ==================== */
 
-/**
- * phantom_node_create - 创建新节点
- * 使用kzalloc分配内存，确保内存清零
- */
-struct phantom_node *phantom_node_create(u32 id, u32 data_len)
+void vfs_stats_init(void)
 {
-    struct phantom_node *node;
-    void *data_buf = NULL;
+    atomic64_set(&g_ctx.stats.open_count, 0);
+    atomic64_set(&g_ctx.stats.read_count, 0);
+    atomic64_set(&g_ctx.stats.write_count, 0);
+    atomic64_set(&g_ctx.stats.close_count, 0);
+    atomic64_set(&g_ctx.stats.denied_count, 0);
+    g_ctx.stats.last_updated = ktime_get_real_seconds();
+}
 
-    phantom_trace_func();
+void vfs_stats_reset(void)
+{
+    vfs_stats_init();
+    vfs_trace("stats reset");
+}
 
-    /* 参数检查 */
-    if (id < PHANTOM_NODE_ID_MIN || id > PHANTOM_NODE_ID_MAX) {
-        phantom_trace("invalid node id: %u", id);
-        return NULL;
+/* 操作类型: 0=open, 1=read, 2=write, 3=close, 4=denied */
+void vfs_stats_update(int op_type)
+{
+    switch (op_type) {
+    case 0:
+        atomic64_inc(&g_ctx.stats.open_count);
+        break;
+    case 1:
+        atomic64_inc(&g_ctx.stats.read_count);
+        break;
+    case 2:
+        atomic64_inc(&g_ctx.stats.write_count);
+        break;
+    case 3:
+        atomic64_inc(&g_ctx.stats.close_count);
+        break;
+    case 4:
+        atomic64_inc(&g_ctx.stats.denied_count);
+        break;
     }
+    g_ctx.stats.last_updated = ktime_get_real_seconds();
+}
 
-    /* 分配节点结构体内存 */
-    node = kzalloc(sizeof(*node), GFP_KERNEL);
-    if (!node) {
-        phantom_trace("failed to allocate node structure");
-        return NULL;
-    }
+int vfs_stats_get_string(char *buf, size_t size)
+{
+    return snprintf(buf, size,
+        "open: %lld\n"
+        "read: %lld\n"
+        "write: %lld\n"
+        "close: %lld\n"
+        "denied: %lld\n"
+        "last_updated: %lld\n",
+        atomic64_read(&g_ctx.stats.open_count),
+        atomic64_read(&g_ctx.stats.read_count),
+        atomic64_read(&g_ctx.stats.write_count),
+        atomic64_read(&g_ctx.stats.close_count),
+        atomic64_read(&g_ctx.stats.denied_count),
+        g_ctx.stats.last_updated);
+}
 
-    /* 分配数据缓冲区 */
-    if (data_len > 0) {
-        data_buf = kzalloc(data_len, GFP_KERNEL);
-        if (!data_buf) {
-            phantom_trace("failed to allocate data buffer, len=%u", data_len);
-            kfree(node);
-            return NULL;
+/* ==================== 规则引擎实现 ==================== */
+
+/* glob匹配 - 支持 * ? ** */
+static bool glob_match(const char *pattern, const char *path)
+{
+    /* 简化实现: 仅支持 * 和 ** */
+    const char *p = pattern, *s = path;
+    
+    while (*p && *s) {
+        if (*p == '*') {
+            /* 检查是否是 ** (匹配任意字符含/) */
+            if (p[1] == '*') {
+                p += 2;
+                /* ** 匹配剩余所有字符 */
+                if (!*p) return true;
+                /* 递归匹配 */
+                while (*s) {
+                    if (glob_match(p, s)) return true;
+                    s++;
+                }
+                return false;
+            } else {
+                /* * 匹配非/字符 */
+                p++;
+                while (*s && *s != '/') {
+                    if (glob_match(p, s)) return true;
+                    s++;
+                }
+                continue;
+            }
+        } else if (*p == '?') {
+            /* ? 匹配单个非/字符 */
+            p++;
+            if (*s == '/') return false;
+            s++;
+        } else if (*p == *s) {
+            p++;
+            s++;
+        } else {
+            return false;
         }
     }
-
-    /* 初始化节点 */
-    INIT_LIST_HEAD(&node->list);
-    node->id = id;
-    node->timestamp = ktime_get_ns();
-    node->data_len = data_len;
-    node->data = data_buf;
-
-    phantom_trace_node(node, "created");
-
-    return node;
+    
+    /* 处理末尾 * */
+    while (*p == '*') p++;
+    
+    return !*p && !*s;
 }
 
-/**
- * phantom_node_destroy - 销毁节点并释放内存
- * 安全释放节点及其数据缓冲区
- */
-void phantom_node_destroy(struct phantom_node *node)
+struct vfs_rule *vfs_rule_parse(const char *rule_str)
 {
-    if (!node)
-        return;
-
-    phantom_trace_func();
-    phantom_trace_node(node, "destroying");
-
-    /* 确保节点已从链表中移除 */
-    if (!list_empty(&node->list)) {
-        phantom_trace("warning: node still in list, removing");
-        list_del_init(&node->list);
+    struct vfs_rule *rule;
+    char *buf, *action_str, *path_str, *mode_str;
+    int ret;
+    
+    if (!rule_str || strlen(rule_str) > VFS_MAX_RULE_LEN)
+        return NULL;
+    
+    rule = kzalloc(sizeof(*rule), GFP_KERNEL);
+    if (!rule)
+        return NULL;
+    
+    buf = kstrndup(rule_str, VFS_MAX_RULE_LEN, GFP_KERNEL);
+    if (!buf) {
+        kfree(rule);
+        return NULL;
     }
-
-    /* 释放数据缓冲区 */
-    if (node->data) {
-        kfree(node->data);
-        node->data = NULL;
+    
+    /* 解析格式: action:path_pattern:mode */
+    action_str = buf;
+    path_str = strchr(buf, ':');
+    if (!path_str) {
+        kfree(buf);
+        kfree(rule);
+        return NULL;
     }
-
-    /* 释放节点结构体 */
-    kfree(node);
+    *path_str++ = '\0';
+    
+    mode_str = strchr(path_str, ':');
+    if (!mode_str) {
+        kfree(buf);
+        kfree(rule);
+        return NULL;
+    }
+    *mode_str++ = '\0';
+    
+    /* 解析action */
+    if (strcmp(action_str, "allow") == 0)
+        rule->action = VFS_ACTION_ALLOW;
+    else if (strcmp(action_str, "deny") == 0)
+        rule->action = VFS_ACTION_DENY;
+    else {
+        kfree(buf);
+        kfree(rule);
+        return NULL;
+    }
+    
+    /* 解析path_pattern */
+    if (strlen(path_str) > VFS_MAX_PATH_LEN) {
+        kfree(buf);
+        kfree(rule);
+        return NULL;
+    }
+    strncpy(rule->path_pattern, path_str, VFS_MAX_PATH_LEN - 1);
+    
+    /* 解析mode */
+    rule->mode_mask = 0;
+    if (strchr(mode_str, 'r') || strchr(mode_str, 'R'))
+        rule->mode_mask |= VFS_OP_READ;
+    if (strchr(mode_str, 'w') || strchr(mode_str, 'W'))
+        rule->mode_mask |= VFS_OP_WRITE;
+    
+    /* 默认值 */
+    rule->priority = 50;
+    rule->uid_filter = 0;
+    rule->enabled = true;
+    
+    INIT_LIST_HEAD(&rule->list);
+    
+    kfree(buf);
+    return rule;
 }
 
-/**
- * phantom_node_add - 添加节点到链表
- * 使用互斥锁保护链表操作
- */
-int phantom_node_add(struct phantom_node *node)
+bool vfs_rule_match(struct vfs_rule *rule, const char *path, unsigned int mode_mask)
 {
-    int ret = 0;
+    if (!rule || !rule->enabled || !path)
+        return false;
+    
+    /* 检查操作类型 */
+    if ((rule->mode_mask & mode_mask) != mode_mask)
+        return false;
+    
+    /* 检查路径匹配 */
+    return glob_match(rule->path_pattern, path);
+}
 
-    if (!node)
+int vfs_rule_add(struct vfs_rule *rule)
+{
+    if (!rule)
         return -EINVAL;
-
-    phantom_trace_func();
-
-    mutex_lock(&g_state.list_mutex);
-
-    /* 检查ID是否已存在 */
-    struct phantom_node *existing;
-    list_for_each_entry(existing, &g_state.node_list, list) {
-        if (existing->id == node->id) {
-            phantom_trace("node id %u already exists", node->id);
-            ret = -EEXIST;
-            goto unlock;
+    
+    mutex_lock(&g_ctx.rules_mutex);
+    
+    if (g_ctx.rules_count >= VFS_MAX_RULES) {
+        mutex_unlock(&g_ctx.rules_mutex);
+        return -ENOSPC;
+    }
+    
+    /* 按优先级插入 */
+    struct vfs_rule *pos;
+    list_for_each_entry(pos, &g_ctx.rules, list) {
+        if (rule->priority > pos->priority) {
+            list_add_tail(&rule->list, &pos->list);
+            g_ctx.rules_count++;
+            mutex_unlock(&g_ctx.rules_mutex);
+            vfs_trace("rule added: %s:%s", 
+                      rule->action == VFS_ACTION_ALLOW ? "allow" : "deny",
+                      rule->path_pattern);
+            return 0;
         }
     }
-
-    /* 添加到链表尾部 */
-    list_add_tail(&node->list, &g_state.node_list);
-    g_state.node_count++;
-
-    phantom_trace_node(node, "added to list");
-    phantom_trace("total nodes: %u", g_state.node_count);
-
-unlock:
-    mutex_unlock(&g_state.list_mutex);
-    return ret;
+    
+    /* 添加到末尾 */
+    list_add_tail(&rule->list, &g_ctx.rules);
+    g_ctx.rules_count++;
+    
+    mutex_unlock(&g_ctx.rules_mutex);
+    vfs_trace("rule added: %s:%s", 
+              rule->action == VFS_ACTION_ALLOW ? "allow" : "deny",
+              rule->path_pattern);
+    return 0;
 }
 
-/**
- * phantom_node_remove_by_id - 根据ID删除节点
- * 使用list_del_init()确保节点安全移除
- */
-int phantom_node_remove_by_id(u32 id)
+void vfs_rule_remove(struct vfs_rule *rule)
 {
-    struct phantom_node *node, *tmp;
-    int ret = -ENOENT;
-
-    phantom_trace("removing node id=%u", id);
-
-    mutex_lock(&g_state.list_mutex);
-
-    list_for_each_entry_safe(node, tmp, &g_state.node_list, list) {
-        if (node->id == id) {
-            /* 使用list_del_init()安全移除节点 */
-            list_del_init(&node->list);
-            g_state.node_count--;
-
-            phantom_trace_node(node, "removed from list");
-            phantom_trace("total nodes: %u", g_state.node_count);
-
-            /* 释放节点内存 */
-            phantom_node_destroy(node);
-
-            ret = 0;
-            break;
-        }
-    }
-
-    mutex_unlock(&g_state.list_mutex);
-    return ret;
+    if (!rule)
+        return;
+    
+    mutex_lock(&g_ctx.rules_mutex);
+    list_del_init(&rule->list);
+    g_ctx.rules_count--;
+    mutex_unlock(&g_ctx.rules_mutex);
+    
+    kfree(rule);
+    vfs_trace("rule removed");
 }
 
-/**
- * phantom_node_find_by_id - 根据ID查找节点
- * 内部使用，调用者需持有锁
- */
-struct phantom_node *phantom_node_find_by_id(u32 id)
+unsigned int vfs_rules_clear(void)
 {
-    struct phantom_node *node;
-
-    list_for_each_entry(node, &g_state.node_list, list) {
-        if (node->id == id)
-            return node;
-    }
-
-    return NULL;
-}
-
-/**
- * phantom_list_clear_all - 清空所有节点
- * 返回删除的节点数量
- */
-u32 phantom_list_clear_all(void)
-{
-    struct phantom_node *node, *tmp;
-    u32 count = 0;
-
-    phantom_trace_func();
-
-    mutex_lock(&g_state.list_mutex);
-
-    list_for_each_entry_safe(node, tmp, &g_state.node_list, list) {
-        /* 使用list_del_init()安全移除节点 */
-        list_del_init(&node->list);
+    struct vfs_rule *rule, *tmp;
+    unsigned int count = 0;
+    
+    mutex_lock(&g_ctx.rules_mutex);
+    
+    list_for_each_entry_safe(rule, tmp, &g_ctx.rules, list) {
+        list_del_init(&rule->list);
+        kfree(rule);
         count++;
-
-        phantom_trace_node(node, "cleared");
-
-        /* 释放节点内存 */
-        if (node->data) {
-            kfree(node->data);
-            node->data = NULL;
-        }
-        kfree(node);
     }
-
-    g_state.node_count = 0;
-    INIT_LIST_HEAD(&g_state.node_list);
-
-    mutex_unlock(&g_state.list_mutex);
-
-    phantom_trace("cleared %u nodes", count);
+    
+    g_ctx.rules_count = 0;
+    INIT_LIST_HEAD(&g_ctx.rules);
+    
+    mutex_unlock(&g_ctx.rules_mutex);
+    
+    vfs_trace("rules cleared: %u", count);
     return count;
 }
 
-/**
- * phantom_list_cleanup - 模块卸载时清理所有节点
- * 研究重点：使用list_del_init()确保节点安全移除
- */
-void phantom_list_cleanup(void)
+enum vfs_action vfs_rules_check(const char *path, unsigned int mode_mask)
 {
-    struct phantom_node *node, *tmp;
-    u32 count = 0;
-
-    phantom_trace_func();
-
-    /* 遍历并摘除所有节点 */
-    mutex_lock(&g_state.list_mutex);
-
-    /*
-     * 使用list_for_each_entry_safe进行安全遍历
-     * 使用list_del_init()将节点从链表中移除并重新初始化
-     * 这是研究重点：确保节点安全移除，list_empty()返回true
-     */
-    list_for_each_entry_safe(node, tmp, &g_state.node_list, list) {
-        /* list_del_init() - 从链表中删除节点并重新初始化list_head */
-        list_del_init(&node->list);
-        count++;
-
-        phantom_trace_node(node, "detached");
-
-        /* 验证节点已安全移除 */
-        if (list_empty(&node->list)) {
-            phantom_trace("node %u list_empty confirmed", node->id);
+    struct vfs_rule *rule;
+    
+    mutex_lock(&g_ctx.rules_mutex);
+    
+    list_for_each_entry(rule, &g_ctx.rules, list) {
+        if (vfs_rule_match(rule, path, mode_mask)) {
+            enum vfs_action action = rule->action;
+            mutex_unlock(&g_ctx.rules_mutex);
+            vfs_trace_level(3, "rule matched: %s -> %s", path,
+                           action == VFS_ACTION_ALLOW ? "allow" : "deny");
+            return action;
         }
-
-        /* 释放节点资源 */
-        if (node->data) {
-            kfree(node->data);
-            node->data = NULL;
-        }
-        kfree(node);
     }
+    
+    mutex_unlock(&g_ctx.rules_mutex);
+    
+    /* 无匹配，返回默认动作 */
+    return g_ctx.policy.default_action;
+}
 
-    /* 重新初始化链表头 */
-    INIT_LIST_HEAD(&g_state.node_list);
-    g_state.node_count = 0;
+/* ==================== Hook管理实现 ==================== */
 
-    mutex_unlock(&g_state.list_mutex);
+int vfs_hook_add(enum vfs_hook_type type, const char *identifier,
+                 uid_t uid, enum vfs_hook_mode mode)
+{
+    struct vfs_hook_target *hook;
+    
+    if (!identifier)
+        return -EINVAL;
+    
+    if (type == VFS_HOOK_PID && strlen(identifier) > 16)
+        return -EINVAL;
+    
+    if (type == VFS_HOOK_PACKAGE && strlen(identifier) > VFS_MAX_PKG_LEN)
+        return -EINVAL;
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    if (g_ctx.hooks_count >= VFS_MAX_HOOKS) {
+        mutex_unlock(&g_ctx.hooks_mutex);
+        return -ENOSPC;
+    }
+    
+    /* 检查是否已存在 */
+    struct vfs_hook_target *existing;
+    list_for_each_entry(existing, &g_ctx.hooks, list) {
+        if (existing->type == type) {
+            if (type == VFS_HOOK_PID && existing->pid == atoi(identifier)) {
+                mutex_unlock(&g_ctx.hooks_mutex);
+                return -EEXIST;
+            }
+            if (type == VFS_HOOK_PACKAGE && 
+                strcmp(existing->package_name, identifier) == 0) {
+                mutex_unlock(&g_ctx.hooks_mutex);
+                return -EEXIST;
+            }
+        }
+    }
+    
+    hook = kzalloc(sizeof(*hook), GFP_KERNEL);
+    if (!hook) {
+        mutex_unlock(&g_ctx.hooks_mutex);
+        return -ENOMEM;
+    }
+    
+    hook->type = type;
+    hook->uid = uid;
+    hook->mode = mode;
+    hook->enabled = true;
+    
+    if (type == VFS_HOOK_PID) {
+        hook->pid = atoi(identifier);
+    } else {
+        strncpy(hook->package_name, identifier, VFS_MAX_PKG_LEN - 1);
+    }
+    
+    INIT_LIST_HEAD(&hook->list);
+    list_add_tail(&hook->list, &g_ctx.hooks);
+    g_ctx.hooks_count++;
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    
+    vfs_trace("hook added: type=%d, id=%s, uid=%u, mode=%d",
+              type, identifier, uid, mode);
+    return 0;
+}
 
-    phantom_trace("cleanup completed, %u nodes freed", count);
+int vfs_hook_remove(enum vfs_hook_type type, const char *identifier)
+{
+    struct vfs_hook_target *hook, *tmp;
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    list_for_each_entry_safe(hook, tmp, &g_ctx.hooks, list) {
+        if (hook->type == type) {
+            bool match = false;
+            if (type == VFS_HOOK_PID && hook->pid == atoi(identifier))
+                match = true;
+            if (type == VFS_HOOK_PACKAGE && 
+                strcmp(hook->package_name, identifier) == 0)
+                match = true;
+            
+            if (match) {
+                list_del_init(&hook->list);
+                g_ctx.hooks_count--;
+                kfree(hook);
+                mutex_unlock(&g_ctx.hooks_mutex);
+                vfs_trace("hook removed: type=%d, id=%s", type, identifier);
+                return 0;
+            }
+        }
+    }
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    return -ENOENT;
+}
+
+struct vfs_hook_target *vfs_hook_check(pid_t pid, uid_t uid, unsigned int *mode_mask)
+{
+    struct vfs_hook_target *hook;
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    list_for_each_entry(hook, &g_ctx.hooks, list) {
+        if (!hook->enabled)
+            continue;
+        
+        if (hook->type == VFS_HOOK_PID && hook->pid == pid) {
+            *mode_mask = hook->mode;
+            mutex_unlock(&g_ctx.hooks_mutex);
+            return hook;
+        }
+        
+        if (hook->type == VFS_HOOK_PACKAGE && hook->uid == uid) {
+            *mode_mask = hook->mode;
+            mutex_unlock(&g_ctx.hooks_mutex);
+            return hook;
+        }
+    }
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    return NULL;
+}
+
+unsigned int vfs_hooks_clear(void)
+{
+    struct vfs_hook_target *hook, *tmp;
+    unsigned int count = 0;
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    list_for_each_entry_safe(hook, tmp, &g_ctx.hooks, list) {
+        list_del_init(&hook->list);
+        kfree(hook);
+        count++;
+    }
+    
+    g_ctx.hooks_count = 0;
+    INIT_LIST_HEAD(&g_ctx.hooks);
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    
+    vfs_trace("hooks cleared: %u", count);
+    return count;
 }
 
 /* ==================== sysfs属性实现 ==================== */
 
-/* 属性声明 */
-static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
-                           char *buf);
-static ssize_t node_count_show(struct kobject *kobj, struct kobj_attribute *attr,
-                               char *buf);
-static ssize_t add_node_store(struct kobject *kobj, struct kobj_attribute *attr,
-                              const char *buf, size_t count);
-static ssize_t remove_node_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                 const char *buf, size_t count);
-static ssize_t clear_nodes_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                 const char *buf, size_t count);
+/* stats (0444) */
+static ssize_t stats_show(struct kobject *kobj, struct kobj_attribute *attr,
+                          char *buf)
+{
+    return vfs_stats_get_string(buf, PAGE_SIZE);
+}
 
-/* 属性定义 */
-static struct kobj_attribute status_attr =
-    __ATTR(status, 0444, status_show, NULL);
+/* stats_reset (0200) */
+static ssize_t stats_reset_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    vfs_stats_reset();
+    return count;
+}
 
-static struct kobj_attribute node_count_attr =
-    __ATTR(node_count, 0444, node_count_show, NULL);
+/* enabled (0644) */
+static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
+                            char *buf)
+{
+    return sprintf(buf, "%d\n", g_ctx.policy.enabled ? 1 : 0);
+}
 
-static struct kobj_attribute add_node_attr =
-    __ATTR(add_node, 0200, NULL, add_node_store);
+static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
+                             const char *buf, size_t count)
+{
+    bool val;
+    int ret = kstrtobool(buf, &val);
+    if (ret)
+        return ret;
+    
+    g_ctx.policy.enabled = val;
+    vfs_trace("enabled set to %d", val);
+    return count;
+}
 
-static struct kobj_attribute remove_node_attr =
-    __ATTR(remove_node, 0200, NULL, remove_node_store);
+/* log_level (0644) */
+static ssize_t log_level_show(struct kobject *kobj, struct kobj_attribute *attr,
+                              char *buf)
+{
+    return sprintf(buf, "%u\n", g_ctx.policy.log_level);
+}
 
-static struct kobj_attribute clear_nodes_attr =
-    __ATTR(clear_nodes, 0200, NULL, clear_nodes_store);
+static ssize_t log_level_store(struct kobject *kobj, struct kobj_attribute *attr,
+                               const char *buf, size_t count)
+{
+    unsigned int val;
+    int ret = kstrtouint(buf, 10, &val);
+    if (ret)
+        return ret;
+    
+    if (val > 5)
+        return -EINVAL;
+    
+    g_ctx.policy.log_level = val;
+    vfs_trace("log_level set to %u", val);
+    return count;
+}
 
-/* 属性组 */
-static struct attribute *phantom_attrs[] = {
-    &status_attr.attr,
-    &node_count_attr.attr,
-    &add_node_attr.attr,
-    &remove_node_attr.attr,
-    &clear_nodes_attr.attr,
+/* default_action (0644) */
+static ssize_t default_action_show(struct kobject *kobj, struct kobj_attribute *attr,
+                                   char *buf)
+{
+    return sprintf(buf, "%s\n",
+                   g_ctx.policy.default_action == VFS_ACTION_ALLOW ? "allow" : "deny");
+}
+
+static ssize_t default_action_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                    const char *buf, size_t count)
+{
+    if (strncmp(buf, "allow", 5) == 0)
+        g_ctx.policy.default_action = VFS_ACTION_ALLOW;
+    else if (strncmp(buf, "deny", 4) == 0)
+        g_ctx.policy.default_action = VFS_ACTION_DENY;
+    else
+        return -EINVAL;
+    
+    vfs_trace("default_action set to %s",
+              g_ctx.policy.default_action == VFS_ACTION_ALLOW ? "allow" : "deny");
+    return count;
+}
+
+/* rules (0644) */
+static ssize_t rules_show(struct kobject *kobj, struct kobj_attribute *attr,
+                          char *buf)
+{
+    struct vfs_rule *rule;
+    int len = 0;
+    
+    mutex_lock(&g_ctx.rules_mutex);
+    
+    list_for_each_entry(rule, &g_ctx.rules, list) {
+        if (rule->enabled) {
+            char mode_str[4] = "";
+            if (rule->mode_mask & VFS_OP_READ) strcat(mode_str, "r");
+            if (rule->mode_mask & VFS_OP_WRITE) strcat(mode_str, "w");
+            
+            len += sprintf(buf + len, "%s:%s:%s\n",
+                          rule->action == VFS_ACTION_ALLOW ? "allow" : "deny",
+                          rule->path_pattern,
+                          mode_str);
+            
+            if (len >= PAGE_SIZE - 100)
+                break;
+        }
+    }
+    
+    mutex_unlock(&g_ctx.rules_mutex);
+    return len;
+}
+
+static ssize_t rules_store(struct kobject *kobj, struct kobj_attribute *attr,
+                           const char *buf, size_t count)
+{
+    char *buf_copy, *line;
+    int added = 0;
+    
+    buf_copy = kstrndup(buf, count, GFP_KERNEL);
+    if (!buf_copy)
+        return -ENOMEM;
+    
+    line = buf_copy;
+    while (line) {
+        char *next = strchr(line, '\n');
+        if (next) *next++ = '\0';
+        
+        /* 跳过空行 */
+        if (strlen(line) > 0) {
+            struct vfs_rule *rule = vfs_rule_parse(line);
+            if (rule) {
+                int ret = vfs_rule_add(rule);
+                if (ret == 0)
+                    added++;
+                else
+                    kfree(rule);
+            }
+        }
+        
+        line = next;
+    }
+    
+    kfree(buf_copy);
+    vfs_trace("rules added: %d", added);
+    return count;
+}
+
+/* rules_clear (0200) */
+static ssize_t rules_clear_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    vfs_rules_clear();
+    return count;
+}
+
+/* hook_targets (0644) */
+static ssize_t hook_targets_show(struct kobject *kobj, struct kobj_attribute *attr,
+                                 char *buf)
+{
+    struct vfs_hook_target *hook;
+    int len = 0;
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    list_for_each_entry(hook, &g_ctx.hooks, list) {
+        const char *type_str = hook->type == VFS_HOOK_PID ? "PID" : "PACKAGE";
+        const char *id_str = hook->type == VFS_HOOK_PID ? 
+            kasprintf(GFP_KERNEL, "%d", hook->pid) : hook->package_name;
+        const char *mode_str;
+        
+        switch (hook->mode) {
+        case VFS_HOOK_MONITOR_ONLY: mode_str = "MONITOR_ONLY"; break;
+        case VFS_HOOK_INTERCEPT_READ: mode_str = "INTERCEPT_READ"; break;
+        case VFS_HOOK_INTERCEPT_WRITE: mode_str = "INTERCEPT_WRITE"; break;
+        case VFS_HOOK_INTERCEPT_ALL: mode_str = "INTERCEPT_ALL"; break;
+        default: mode_str = "UNKNOWN"; break;
+        }
+        
+        len += sprintf(buf + len, "%s:%s:%u:%s:%d\n",
+                      type_str, id_str, hook->uid, mode_str, hook->enabled ? 1 : 0);
+        
+        if (hook->type == VFS_HOOK_PID)
+            kfree(id_str);
+        
+        if (len >= PAGE_SIZE - 100)
+            break;
+    }
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    return len;
+}
+
+static ssize_t hook_targets_store(struct kobject *kobj, struct kobj_attribute *attr,
+                                  const char *buf, size_t count)
+{
+    char *buf_copy, *cmd, *type_str, *identifier, *uid_str, *mode_str;
+    int ret = 0;
+    
+    buf_copy = kstrndup(buf, count, GFP_KERNEL);
+    if (!buf_copy)
+        return -ENOMEM;
+    
+    cmd = buf_copy;
+    
+    /* 解析格式: add:TYPE:identifier:uid:mode 或 remove:TYPE:identifier */
+    if (strncmp(cmd, "add:", 4) == 0) {
+        cmd += 4;
+        type_str = cmd;
+        identifier = strchr(cmd, ':');
+        if (!identifier) { kfree(buf_copy); return -EINVAL; }
+        *identifier++ = '\0';
+        uid_str = strchr(identifier, ':');
+        if (!uid_str) { kfree(buf_copy); return -EINVAL; }
+        *uid_str++ = '\0';
+        mode_str = strchr(uid_str, ':');
+        if (!mode_str) { kfree(buf_copy); return -EINVAL; }
+        *mode_str++ = '\0';
+        
+        enum vfs_hook_type type = strcmp(type_str, "PID") == 0 ? 
+            VFS_HOOK_PID : VFS_HOOK_PACKAGE;
+        uid_t uid = atoi(uid_str);
+        enum vfs_hook_mode mode;
+        
+        if (strcmp(mode_str, "MONITOR_ONLY") == 0) mode = VFS_HOOK_MONITOR_ONLY;
+        else if (strcmp(mode_str, "INTERCEPT_READ") == 0) mode = VFS_HOOK_INTERCEPT_READ;
+        else if (strcmp(mode_str, "INTERCEPT_WRITE") == 0) mode = VFS_HOOK_INTERCEPT_WRITE;
+        else if (strcmp(mode_str, "INTERCEPT_ALL") == 0) mode = VFS_HOOK_INTERCEPT_ALL;
+        else { kfree(buf_copy); return -EINVAL; }
+        
+        ret = vfs_hook_add(type, identifier, uid, mode);
+    } else if (strncmp(cmd, "remove:", 7) == 0) {
+        cmd += 7;
+        type_str = cmd;
+        identifier = strchr(cmd, ':');
+        if (!identifier) { kfree(buf_copy); return -EINVAL; }
+        *identifier++ = '\0';
+        
+        enum vfs_hook_type type = strcmp(type_str, "PID") == 0 ?
+            VFS_HOOK_PID : VFS_HOOK_PACKAGE;
+        
+        ret = vfs_hook_remove(type, identifier);
+    } else {
+        kfree(buf_copy);
+        return -EINVAL;
+    }
+    
+    kfree(buf_copy);
+    
+    if (ret)
+        return ret;
+    
+    return count;
+}
+
+/* hook_list (0444) */
+static ssize_t hook_list_show(struct kobject *kobj, struct kobj_attribute *attr,
+                              char *buf)
+{
+    struct vfs_hook_target *hook;
+    int len = 0, idx = 1;
+    
+    len += sprintf(buf + len, "# ID    TYPE     IDENTIFIER          UID    MODE           ENABLED\n");
+    
+    mutex_lock(&g_ctx.hooks_mutex);
+    
+    list_for_each_entry(hook, &g_ctx.hooks, list) {
+        const char *type_str = hook->type == VFS_HOOK_PID ? "PID" : "PACKAGE";
+        const char *id_str = hook->type == VFS_HOOK_PID ?
+            kasprintf(GFP_KERNEL, "%d", hook->pid) : hook->package_name;
+        const char *mode_str;
+        
+        switch (hook->mode) {
+        case VFS_HOOK_MONITOR_ONLY: mode_str = "MONITOR_ONLY"; break;
+        case VFS_HOOK_INTERCEPT_READ: mode_str = "INTERCEPT_READ"; break;
+        case VFS_HOOK_INTERCEPT_WRITE: mode_str = "INTERCEPT_WRITE"; break;
+        case VFS_HOOK_INTERCEPT_ALL: mode_str = "INTERCEPT_ALL"; break;
+        default: mode_str = "UNKNOWN"; break;
+        }
+        
+        len += sprintf(buf + len, "%04d   %-8s %-19s %6u  %-14s %s\n",
+                      idx, type_str, id_str, hook->uid, mode_str,
+                      hook->enabled ? "yes" : "no");
+        
+        if (hook->type == VFS_HOOK_PID)
+            kfree(id_str);
+        
+        idx++;
+        if (len >= PAGE_SIZE - 100)
+            break;
+    }
+    
+    mutex_unlock(&g_ctx.hooks_mutex);
+    return len;
+}
+
+/* version (0444) */
+static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
+                            char *buf)
+{
+    return sprintf(buf, "%s\n", AURORA_VFS_VERSION);
+}
+
+/* ==================== sysfs属性定义 ==================== */
+
+static struct kobj_attribute stats_attr = __ATTR(stats, 0444, stats_show, NULL);
+static struct kobj_attribute stats_reset_attr = __ATTR(stats_reset, 0200, NULL, stats_reset_store);
+static struct kobj_attribute enabled_attr = __ATTR(enabled, 0644, enabled_show, enabled_store);
+static struct kobj_attribute log_level_attr = __ATTR(log_level, 0644, log_level_show, log_level_store);
+static struct kobj_attribute default_action_attr = __ATTR(default_action, 0644, default_action_show, default_action_store);
+static struct kobj_attribute rules_attr = __ATTR(rules, 0644, rules_show, rules_store);
+static struct kobj_attribute rules_clear_attr = __ATTR(rules_clear, 0200, NULL, rules_clear_store);
+static struct kobj_attribute hook_targets_attr = __ATTR(hook_targets, 0644, hook_targets_show, hook_targets_store);
+static struct kobj_attribute hook_list_attr = __ATTR(hook_list, 0444, hook_list_show, NULL);
+static struct kobj_attribute version_attr = __ATTR(version, 0444, version_show, NULL);
+
+static struct attribute *vfs_attrs[] = {
+    &stats_attr.attr,
+    &stats_reset_attr.attr,
+    &enabled_attr.attr,
+    &log_level_attr.attr,
+    &default_action_attr.attr,
+    &rules_attr.attr,
+    &rules_clear_attr.attr,
+    &hook_targets_attr.attr,
+    &hook_list_attr.attr,
+    &version_attr.attr,
     NULL,
 };
 
-static struct attribute_group phantom_attr_group = {
-    .attrs = phantom_attrs,
+static struct attribute_group vfs_attr_group = {
+    .attrs = vfs_attrs,
 };
 
-/**
- * status_show - 显示模块状态
- * 格式: status: <initialized>, version: <version>, nodes: <count>
- */
-static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
-                           char *buf)
+/* ==================== sysfs初始化 ==================== */
+
+int vfs_sysfs_init(void)
 {
-    phantom_trace("status_show called");
-
-    return sprintf(buf, "status: %s\nversion: %s\nnodes: %u\n",
-                   g_state.initialized ? "initialized" : "uninitialized",
-                   PHANTOM_LKM_VERSION,
-                   g_state.node_count);
-}
-
-/**
- * node_count_show - 显示链表节点数量
- */
-static ssize_t node_count_show(struct kobject *kobj, struct kobj_attribute *attr,
-                               char *buf)
-{
-    phantom_trace("node_count_show called, count=%u", g_state.node_count);
-
-    return sprintf(buf, "%u\n", g_state.node_count);
-}
-
-/**
- * add_node_store - 添加新节点
- * 输入格式: "<id> [<data_len>]"
- * 例如: "100" 或 "100 256"
- */
-static ssize_t add_node_store(struct kobject *kobj, struct kobj_attribute *attr,
-                              const char *buf, size_t count)
-{
-    u32 id, data_len = 0;
-    struct phantom_node *node;
     int ret;
-
-    phantom_trace("add_node_store called, input=%s", buf);
-
-    /* 解析输入 */
-    ret = sscanf(buf, "%u %u", &id, &data_len);
-    if (ret < 1) {
-        phantom_trace("invalid input format");
-        return -EINVAL;
-    }
-
-    /* 限制数据长度 */
-    if (data_len > 4096) {
-        phantom_trace("data_len too large: %u", data_len);
-        return -EINVAL;
-    }
-
-    /* 创建节点 */
-    node = phantom_node_create(id, data_len);
-    if (!node) {
-        phantom_trace("failed to create node %u", id);
+    
+    /* 创建 /sys/kernel/ztrosu 目录 */
+    g_ctx.kobj_root = kobject_create_and_add(AURORA_SYSFS_ROOT, kernel_kobj);
+    if (!g_ctx.kobj_root) {
+        vfs_trace("failed to create ztrosu kobject");
         return -ENOMEM;
     }
-
-    /* 添加到链表 */
-    ret = phantom_node_add(node);
-    if (ret) {
-        phantom_trace("failed to add node %u, ret=%d", id, ret);
-        phantom_node_destroy(node);
-        return ret;
-    }
-
-    phantom_trace("node %u added successfully", id);
-    return count;
-}
-
-/**
- * remove_node_store - 删除指定节点
- * 输入格式: "<id>"
- */
-static ssize_t remove_node_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                 const char *buf, size_t count)
-{
-    u32 id;
-    int ret;
-
-    phantom_trace("remove_node_store called, input=%s", buf);
-
-    /* 解析输入 */
-    ret = sscanf(buf, "%u", &id);
-    if (ret != 1) {
-        phantom_trace("invalid input format");
-        return -EINVAL;
-    }
-
-    /* 删除节点 */
-    ret = phantom_node_remove_by_id(id);
-    if (ret) {
-        phantom_trace("node %u not found", id);
-        return ret;
-    }
-
-    phantom_trace("node %u removed successfully", id);
-    return count;
-}
-
-/**
- * clear_nodes_store - 清空所有节点
- * 输入: 任意非空内容触发清空
- */
-static ssize_t clear_nodes_store(struct kobject *kobj, struct kobj_attribute *attr,
-                                 const char *buf, size_t count)
-{
-    u32 cleared;
-
-    phantom_trace("clear_nodes_store called");
-
-    cleared = phantom_list_clear_all();
-    phantom_trace("cleared %u nodes", cleared);
-
-    return count;
-}
-
-/**
- * phantom_sysfs_init - 初始化sysfs节点
- * 创建 /sys/kernel/phantom_lkm/ 目录及属性文件
- */
-int phantom_sysfs_init(void)
-{
-    int ret;
-
-    phantom_trace_func();
-
-    /* 在 /sys/kernel/ 下创建目录 */
-    g_state.kobj = kobject_create_and_add(PHANTOM_SYSFS_DIR, kernel_kobj);
-    if (!g_state.kobj) {
-        phantom_trace("failed to create kobject");
+    
+    /* 创建 /sys/kernel/ztrosu/vfs 目录 */
+    g_ctx.kobj_vfs = kobject_create_and_add(AURORA_SYSFS_DIR, g_ctx.kobj_root);
+    if (!g_ctx.kobj_vfs) {
+        vfs_trace("failed to create vfs kobject");
+        kobject_put(g_ctx.kobj_root);
+        g_ctx.kobj_root = NULL;
         return -ENOMEM;
     }
-
+    
     /* 创建属性组 */
-    ret = sysfs_create_group(g_state.kobj, &phantom_attr_group);
+    ret = sysfs_create_group(g_ctx.kobj_vfs, &vfs_attr_group);
     if (ret) {
-        phantom_trace("failed to create sysfs group, ret=%d", ret);
-        kobject_put(g_state.kobj);
-        g_state.kobj = NULL;
+        vfs_trace("failed to create sysfs group: %d", ret);
+        kobject_put(g_ctx.kobj_vfs);
+        g_ctx.kobj_vfs = NULL;
+        kobject_put(g_ctx.kobj_root);
+        g_ctx.kobj_root = NULL;
         return ret;
     }
-
-    phantom_trace("sysfs initialized at /sys/kernel/%s", PHANTOM_SYSFS_DIR);
+    
+    vfs_trace("sysfs initialized at /sys/kernel/%s/%s", 
+              AURORA_SYSFS_ROOT, AURORA_SYSFS_DIR);
     return 0;
 }
 
-/**
- * phantom_sysfs_exit - 注销所有sysfs节点
- * 研究重点：安全注销sysfs节点，避免use-after-free
- */
-void phantom_sysfs_exit(void)
+void vfs_sysfs_exit(void)
 {
-    phantom_trace_func();
-
-    if (g_state.kobj) {
-        /*
-         * 先移除属性组，再释放kobject
-         * 这是研究重点：确保sysfs节点在kobject释放前已注销
-         */
-        sysfs_remove_group(g_state.kobj, &phantom_attr_group);
-        phantom_trace("sysfs group removed");
-
-        /* 释放kobject引用 */
-        kobject_put(g_state.kobj);
-        g_state.kobj = NULL;
-
-        phantom_trace("kobject released");
+    if (g_ctx.kobj_vfs) {
+        sysfs_remove_group(g_ctx.kobj_vfs, &vfs_attr_group);
+        kobject_put(g_ctx.kobj_vfs);
+        g_ctx.kobj_vfs = NULL;
     }
+    
+    if (g_ctx.kobj_root) {
+        kobject_put(g_ctx.kobj_root);
+        g_ctx.kobj_root = NULL;
+    }
+    
+    vfs_trace("sysfs exited");
 }
 
 /* ==================== 模块生命周期 ==================== */
 
-static int __init phantom_lkm_init(void)
+static int __init aurora_vfs_init(void)
 {
     int ret;
-
-    /* 注意：模块加载时使用trace_printk可能看不到输出，
-     * 因为tracing可能尚未完全初始化。
-     * 这里仅作示例，实际输出可通过/sys/kernel/tracing/trace查看 */
-
+    
+    vfs_trace_func();
+    
+    /* 初始化全局上下文 */
+    memset(&g_ctx, 0, sizeof(g_ctx));
+    
     /* 初始化链表 */
-    INIT_LIST_HEAD(&g_state.node_list);
-    mutex_init(&g_state.list_mutex);
-    g_state.node_count = 0;
-
+    INIT_LIST_HEAD(&g_ctx.rules);
+    INIT_LIST_HEAD(&g_ctx.hooks);
+    
+    /* 初始化锁 */
+    mutex_init(&g_ctx.rules_mutex);
+    mutex_init(&g_ctx.hooks_mutex);
+    spin_lock_init(&g_ctx.stats_lock);
+    
+    /* 初始化统计 */
+    vfs_stats_init();
+    
+    /* 初始化策略 */
+    g_ctx.policy.enabled = false;
+    g_ctx.policy.log_level = 0;
+    g_ctx.policy.default_action = VFS_ACTION_ALLOW;
+    
     /* 初始化sysfs */
-    ret = phantom_sysfs_init();
+    ret = vfs_sysfs_init();
     if (ret) {
+        mutex_destroy(&g_ctx.rules_mutex);
+        mutex_destroy(&g_ctx.hooks_mutex);
         return ret;
     }
-
-    g_state.initialized = true;
-
-    /* 此输出在模块加载时可能不可见，需通过trace查看 */
-    phantom_trace("module initialized, version=%s", PHANTOM_LKM_VERSION);
-
+    
+    g_ctx.initialized = true;
+    
+    vfs_trace("module loaded, version=%s", AURORA_VFS_VERSION);
     return 0;
 }
 
-static void __exit phantom_lkm_exit(void)
+static void __exit aurora_vfs_exit(void)
 {
-    phantom_trace_func();
-
-    g_state.initialized = false;
-
-    /*
-     * 清理顺序很重要：
-     * 1. 先注销sysfs节点（防止用户空间继续访问）
-     * 2. 再清理链表节点（释放所有内存）
-     *
-     * 这是研究重点：确保资源释放顺序正确，避免竞态条件
-     */
-
-    /* 步骤1: 注销sysfs节点 */
-    phantom_sysfs_exit();
-
-    /* 步骤2: 清理链表节点 */
-    phantom_list_cleanup();
-
-    /* 步骤3: 销毁互斥锁 */
-    mutex_destroy(&g_state.list_mutex);
-
-    phantom_trace("module exited cleanly");
+    vfs_trace_func();
+    
+    g_ctx.initialized = false;
+    
+    /* 注销sysfs */
+    vfs_sysfs_exit();
+    
+    /* 清理规则 */
+    vfs_rules_clear();
+    
+    /* 清理Hook */
+    vfs_hooks_clear();
+    
+    /* 销毁锁 */
+    mutex_destroy(&g_ctx.rules_mutex);
+    mutex_destroy(&g_ctx.hooks_mutex);
+    
+    vfs_trace("module unloaded");
 }
 
-module_init(phantom_lkm_init);
-module_exit(phantom_lkm_exit);
+module_init(aurora_vfs_init);
+module_exit(aurora_vfs_exit);
 
 MODULE_LICENSE("GPL v2");
-MODULE_AUTHOR(PHANTOM_LKM_AUTHOR);
-MODULE_DESCRIPTION(PHANTOM_LKM_DESC);
-MODULE_VERSION(PHANTOM_LKM_VERSION);
+MODULE_AUTHOR(AURORA_VFS_AUTHOR);
+MODULE_DESCRIPTION(AURORA_VFS_DESC);
+MODULE_VERSION(AURORA_VFS_VERSION);

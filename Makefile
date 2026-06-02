@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: GPL-2.0
-# Makefile for phantom_lkm kernel module
-# 教学研究用内核模块 - 链表动态摘除与sysfs节点管理
+# Makefile for AuroraSU VFS kernel module
+# 对齐 VFS_KERNEL_MODULE_SPEC.md v3.0 规范
 #
 # 目标平台: OnePlus ACE5 (SM8650), 内核 6.1.141, Android 14 GKI
 
 # 模块名称
-MODULE_NAME := phantom_lkm
+MODULE_NAME := aurora_vfs
 
-# 源文件
+# 源文件 (保持 phantom_lkm.c 文件名，输出 aurora_vfs.ko)
 obj-m += $(MODULE_NAME).o
+$(MODULE_NAME)-objs := phantom_lkm.o
 
 # 默认内核源码路径（可通过KDIR参数覆盖）
 KDIR ?= /lib/modules/$(shell uname -r)/build
@@ -20,6 +21,7 @@ ARCH ?= $(shell uname -m)
 
 # 编译标志
 ccflags-y += -Wall -Wextra -Wno-unused-parameter
+ccflags-y += -Wno-declaration-after-statement
 ccflags-y += -O2
 ccflags-y += -g  # 保留调试信息
 
@@ -53,12 +55,21 @@ unload:
 
 # 查看trace输出
 view-trace:
-	@echo "=== Trace output ==="
-	@cat /sys/kernel/tracing/trace | grep phantom_lkm || echo "No trace output found"
+	@echo "=== Aurora VFS Trace output ==="
+	@cat /sys/kernel/tracing/trace | grep aurora_vfs || echo "No trace output found"
 
 # 清空trace缓冲区
 clear-trace:
 	@echo > /sys/kernel/tracing/trace
+
+# 测试sysfs接口
+test-sysfs:
+	@echo "=== Testing sysfs interfaces ==="
+	@echo "Checking /sys/kernel/ztrosu/vfs..."
+	@test -d /sys/kernel/ztrosu/vfs && echo "✓ Directory exists" || echo "✗ Directory not found"
+	@test -f /sys/kernel/ztrosu/vfs/version && cat /sys/kernel/ztrosu/vfs/version || echo "✗ version not found"
+	@test -f /sys/kernel/ztrosu/vfs/stats && cat /sys/kernel/ztrosu/vfs/stats || echo "✗ stats not found"
+	@test -f /sys/kernel/ztrosu/vfs/enabled && cat /sys/kernel/ztrosu/vfs/enabled || echo "✗ enabled not found"
 
 # 帮助信息
 help:
@@ -73,6 +84,7 @@ help:
 	@echo "  unload       - Unload the module (requires root)"
 	@echo "  view-trace   - View trace_printk output"
 	@echo "  clear-trace  - Clear trace buffer"
+	@echo "  test-sysfs   - Test sysfs interfaces (module must be loaded)"
 	@echo "  help         - Show this help message"
 	@echo ""
 	@echo "Variables:"
@@ -90,4 +102,4 @@ help:
 	@echo "  # Build for OnePlus ACE5 (SM8650) kernel"
 	@echo "  make KDIR=/path/to/sm8650-kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-android-"
 
-.PHONY: all clean distclean install load unload view-trace clear-trace help
+.PHONY: all clean distclean install load unload view-trace clear-trace test-sysfs help

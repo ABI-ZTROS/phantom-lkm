@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * phantom_lkm.h - 教学研究用内核模块头文件
- * 研究链表动态摘除操作及sysfs节点注销机制
+ * phantom_lkm.h - AuroraSU VFS 内核模块头文件
+ * 对齐 VFS_KERNEL_MODULE_SPEC.md v3.0 规范
  *
  * 目标平台: OnePlus ACE5 (SM8650), 内核 6.1.141, Android 14 GKI
  */
@@ -16,116 +16,273 @@
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/atomic.h>
 #include <linux/trace_printk.h>
+#include <linux/ktime.h>
 
-/* 模块信息 */
-#define PHANTOM_LKM_NAME        "phantom_lkm"
-#define PHANTOM_LKM_VERSION     "1.0.0"
-#define PHANTOM_LKM_AUTHOR      "AuroraSU Research"
-#define PHANTOM_LKM_DESC        "链表动态摘除与sysfs节点管理教学研究模块"
+/* ==================== 模块信息 ==================== */
 
-/* sysfs目录名称 */
-#define PHANTOM_SYSFS_DIR       "phantom_lkm"
+#define AURORA_VFS_NAME        "aurora_vfs"
+#define AURORA_VFS_VERSION     "3"     /* v3.0 协议版本 */
+#define AURORA_VFS_AUTHOR      "AuroraSU Research"
+#define AURORA_VFS_DESC        "AuroraSU VFS Debug Kernel Module"
 
-/* 节点ID范围 */
-#define PHANTOM_NODE_ID_MIN     1
-#define PHANTOM_NODE_ID_MAX     65535
+/* sysfs 目录路径: /sys/kernel/ztrosu/vfs/ */
+#define AURORA_SYSFS_ROOT      "ztrosu"
+#define AURORA_SYSFS_DIR       "vfs"
 
-/* 自定义数据结构 - 链表节点 */
-struct phantom_node {
-    struct list_head    list;       /* 链表节点 */
-    u32                 id;         /* 节点唯一标识 */
-    u64                 timestamp;  /* 创建时间戳 */
-    u32                 data_len;   /* 数据长度 */
-    void                *data;      /* 动态分配的数据缓冲区 */
+/* ==================== 常量定义 ==================== */
+
+#define VFS_MAX_RULES          64      /* 最大规则数 */
+#define VFS_MAX_HOOKS          128     /* 最大Hook目标数 */
+#define VFS_MAX_RULE_LEN       256     /* 单条规则最大长度 */
+#define VFS_MAX_PATH_LEN       512     /* 路径模式最大长度 */
+#define VFS_MAX_PKG_LEN        256     /* 包名最大长度 */
+
+/* v3 新增 - Pipe通讯 */
+#define VFS_CMD_MAGIC          0xAF5F  /* 命令Magic Number */
+#define VFS_CMD_VERSION        2       /* 命令协议版本 */
+#define VFS_PIPE_TIMEOUT_MS    5000    /* Pipe超时 (毫秒) */
+#define VFS_PIPE_NAME_PREFIX   "aurora_vfs_"
+#define VFS_PIPE_PATH_LEN      32
+
+/* v3 新增 - Netlink通讯 */
+#define AURORA_VFS_NL_FAMILY   NETLINK_USERSOCK
+#define AURORA_VFS_NL_GROUP    31      /* 多播组号 */
+#define VFS_NL_MAX_MSG_LEN     4096    /* 单条事件最大长度 */
+
+/* ==================== 枚举定义 ==================== */
+
+/* 动作类型 */
+enum vfs_action {
+    VFS_ACTION_ALLOW = 0,
+    VFS_ACTION_DENY = 1,
 };
 
-/* 模块全局状态结构 */
-struct phantom_state {
-    struct kobject      *kobj;          /* sysfs根kobject */
-    struct list_head    node_list;      /* 链表头 */
-    struct mutex        list_mutex;     /* 链表操作互斥锁 */
-    u32                 node_count;     /* 当前节点数量 */
-    bool                initialized;    /* 模块初始化标志 */
+/* Hook类型 */
+enum vfs_hook_type {
+    VFS_HOOK_PID = 0,
+    VFS_HOOK_PACKAGE = 1,
 };
 
-/* 属性组结构前向声明 */
-struct phantom_attr_group;
+/* Hook模式 */
+enum vfs_hook_mode {
+    VFS_HOOK_MONITOR_ONLY = 0,     /* 仅监控 */
+    VFS_HOOK_INTERCEPT_READ = 1,   /* 拦截读 */
+    VFS_HOOK_INTERCEPT_WRITE = 2,  /* 拦截写 */
+    VFS_HOOK_INTERCEPT_ALL = 3,    /* 拦截全部 */
+};
 
-/* ==================== 链表操作接口 ==================== */
+/* 操作类型掩码 */
+#define VFS_OP_READ    0x01    /* bit0: 读 */
+#define VFS_OP_WRITE   0x02    /* bit1: 写 */
+
+/* ==================== 数据结构 ==================== */
+
+/* 规则结构 */
+struct vfs_rule {
+    struct list_head    list;
+    int                 priority;           /* 优先级 (数字越大越先匹配) */
+    enum vfs_action     action;             /* ALLOW / DENY */
+    char                path_pattern[VFS_MAX_PATH_LEN];
+    unsigned int        mode_mask;          /* 操作类型掩码 */
+    uid_t               uid_filter;         /* UID过滤 (0=不限制) */
+    bool                enabled;
+};
+
+/* Hook目标结构 */
+struct vfs_hook_target {
+    struct list_head    list;
+    enum vfs_hook_type  type;               /* PID / PACKAGE */
+    union {
+        pid_t           pid;
+        char            package_name[VFS_MAX_PKG_LEN];
+    };
+    uid_t               uid;
+    enum vfs_hook_mode  mode;
+    bool                enabled;
+};
+
+/* 统计结构 */
+struct vfs_stats {
+    atomic64_t          open_count;
+    atomic64_t          read_count;
+    atomic64_t          write_count;
+    atomic64_t          close_count;
+    atomic64_t          denied_count;
+    u64                 last_updated;
+};
+
+/* 全局策略 */
+struct vfs_policy {
+    bool                enabled;            /* 全局开关 */
+    unsigned int        log_level;          /* 日志级别 0-5 */
+    enum vfs_action     default_action;     /* 默认动作 */
+};
+
+/* 全局上下文 */
+struct vfs_debug_ctx {
+    /* sysfs */
+    struct kobject      *kobj_root;         /* /sys/kernel/ztrosu */
+    struct kobject      *kobj_vfs;          /* /sys/kernel/ztrosu/vfs */
+    
+    /* 数据 */
+    struct vfs_stats    stats;
+    struct vfs_policy   policy;
+    struct list_head    rules;              /* 规则链表 */
+    struct list_head    hooks;              /* Hook目标链表 */
+    unsigned int        rules_count;
+    unsigned int        hooks_count;
+    
+    /* 同步 */
+    struct mutex        rules_mutex;        /* 规则链表锁 */
+    struct mutex        hooks_mutex;        /* Hook链表锁 */
+    spinlock_t          stats_lock;         /* 统计更新锁 */
+    
+    /* 状态 */
+    bool                initialized;
+    
+    /* v3 新增 - Netlink (阶段3实现) */
+    struct sock         *nlsk;
+    
+    /* v3 新增 - Pipe (阶段2实现) */
+    struct task_struct  *pipe_thread;
+};
+
+/* ==================== 规则引擎接口 ==================== */
 
 /**
- * phantom_node_create - 创建新节点
- * @id: 节点ID
- * @data_len: 数据缓冲区大小
- * @return: 成功返回节点指针，失败返回NULL
+ * vfs_rule_parse - 解析规则字符串
+ * @rule_str: 规则字符串，格式 "action:path_pattern:mode"
+ * @return: 成功返回规则指针，失败返回NULL
  */
-struct phantom_node *phantom_node_create(u32 id, u32 data_len);
+struct vfs_rule *vfs_rule_parse(const char *rule_str);
 
 /**
- * phantom_node_destroy - 销毁节点并释放内存
- * @node: 要销毁的节点
+ * vfs_rule_match - 检查路径是否匹配规则
+ * @rule: 规则指针
+ * @path: 文件路径
+ * @mode_mask: 操作类型掩码
+ * @return: 匹配返回true
  */
-void phantom_node_destroy(struct phantom_node *node);
+bool vfs_rule_match(struct vfs_rule *rule, const char *path, unsigned int mode_mask);
 
 /**
- * phantom_node_add - 添加节点到链表
- * @node: 要添加的节点
- * @return: 成功返回0，失败返回错误码
+ * vfs_rule_add - 添加规则到链表
+ * @rule: 规则指针
+ * @return: 成功返回0
  */
-int phantom_node_add(struct phantom_node *node);
+int vfs_rule_add(struct vfs_rule *rule);
 
 /**
- * phantom_node_remove_by_id - 根据ID删除节点
- * @id: 要删除的节点ID
- * @return: 成功返回0，未找到返回-ENOENT
+ * vfs_rule_remove - 移除规则
+ * @rule: 规则指针
  */
-int phantom_node_remove_by_id(u32 id);
+void vfs_rule_remove(struct vfs_rule *rule);
 
 /**
- * phantom_node_find_by_id - 根据ID查找节点
- * @id: 要查找的节点ID
- * @return: 找到返回节点指针，未找到返回NULL
+ * vfs_rules_clear - 清空所有规则
+ * @return: 清空的规则数量
  */
-struct phantom_node *phantom_node_find_by_id(u32 id);
+unsigned int vfs_rules_clear(void);
 
 /**
- * phantom_list_clear_all - 清空所有节点
- * @return: 删除的节点数量
+ * vfs_rules_check - 检查路径是否允许访问
+ * @path: 文件路径
+ * @mode_mask: 操作类型掩码
+ * @return: VFS_ACTION_ALLOW 或 VFS_ACTION_DENY
  */
-u32 phantom_list_clear_all(void);
+enum vfs_action vfs_rules_check(const char *path, unsigned int mode_mask);
+
+/* ==================== Hook管理接口 ==================== */
 
 /**
- * phantom_list_cleanup - 模块卸载时清理所有节点
- * 使用list_del_init()确保节点安全移除
+ * vfs_hook_add - 添加Hook目标
+ * @type: Hook类型 (PID/PACKAGE)
+ * @identifier: PID字符串或包名
+ * @uid: 目标UID
+ * @mode: Hook模式
+ * @return: 成功返回0
  */
-void phantom_list_cleanup(void);
-
-/* ==================== sysfs属性接口 ==================== */
-
-/**
- * phantom_sysfs_init - 初始化sysfs节点
- * @return: 成功返回0，失败返回错误码
- */
-int phantom_sysfs_init(void);
+int vfs_hook_add(enum vfs_hook_type type, const char *identifier, 
+                 uid_t uid, enum vfs_hook_mode mode);
 
 /**
- * phantom_sysfs_exit - 注销所有sysfs节点
+ * vfs_hook_remove - 移除Hook目标
+ * @type: Hook类型
+ * @identifier: PID字符串或包名
+ * @return: 成功返回0
  */
-void phantom_sysfs_exit(void);
+int vfs_hook_remove(enum vfs_hook_type type, const char *identifier);
+
+/**
+ * vfs_hook_check - 检查当前进程是否在Hook列表中
+ * @pid: 进程PID
+ * @uid: 进程UID
+ * @mode_mask: 操作类型掩码 (用于返回匹配的mode)
+ * @return: 匹配返回Hook指针，未匹配返回NULL
+ */
+struct vfs_hook_target *vfs_hook_check(pid_t pid, uid_t uid, unsigned int *mode_mask);
+
+/**
+ * vfs_hooks_clear - 清空所有Hook目标
+ * @return: 清空的目标数量
+ */
+unsigned int vfs_hooks_clear(void);
+
+/* ==================== 统计接口 ==================== */
+
+/**
+ * vfs_stats_init - 初始化统计计数器
+ */
+void vfs_stats_init(void);
+
+/**
+ * vfs_stats_reset - 重置统计计数器
+ */
+void vfs_stats_reset(void);
+
+/**
+ * vfs_stats_update - 更新统计计数器
+ * @op_type: 操作类型 (open/read/write/close/denied)
+ */
+void vfs_stats_update(int op_type);
+
+/**
+ * vfs_stats_get_string - 获取统计信息字符串
+ * @buf: 输出缓冲区
+ * @size: 缓冲区大小
+ * @return: 写入的字节数
+ */
+int vfs_stats_get_string(char *buf, size_t size);
+
+/* ==================== sysfs接口 ==================== */
+
+/**
+ * vfs_sysfs_init - 初始化sysfs接口
+ * @return: 成功返回0
+ */
+int vfs_sysfs_init(void);
+
+/**
+ * vfs_sysfs_exit - 注销sysfs接口
+ */
+void vfs_sysfs_exit(void);
 
 /* ==================== 调试输出宏 ==================== */
 
-/* 仅使用trace_printk进行非持久化输出 */
-#define phantom_trace(fmt, ...) \
-    trace_printk("[phantom_lkm] " fmt "\n", ##__VA_ARGS__)
+#define vfs_trace(fmt, ...) \
+    trace_printk("[aurora_vfs] " fmt "\n", ##__VA_ARGS__)
 
-#define phantom_trace_func() \
-    trace_printk("[phantom_lkm] %s\n", __func__)
+#define vfs_trace_func() \
+    trace_printk("[aurora_vfs] %s\n", __func__)
 
-#define phantom_trace_node(node, action) \
-    trace_printk("[phantom_lkm] %s node: id=%u, ts=%llu, data_len=%u\n", \
-                 action, (node)->id, (node)->timestamp, (node)->data_len)
+#define vfs_trace_level(level, fmt, ...) \
+    do { \
+        if (g_ctx.policy.log_level >= level) \
+            trace_printk("[aurora_vfs] " fmt "\n", ##__VA_ARGS__); \
+    } while (0)
 
 #endif /* _PHANTOM_LKM_H_ */
