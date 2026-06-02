@@ -53,6 +53,14 @@ void vfs_stats_update(int op_type)
     g_ctx.stats.last_updated = ktime_get_real_seconds();
 }
 
+/* 内核安全的整数解析（替代 atoi，失败返回 0） */
+static int safe_atoi(const char *str)
+{
+    int result = 0;
+    kstrtoint(str, 10, &result);
+    return result;
+}
+
 int vfs_stats_get_string(char *buf, size_t size)
 {
     return snprintf(buf, size,
@@ -328,7 +336,7 @@ int vfs_hook_add(enum vfs_hook_type type, const char *identifier,
     struct vfs_hook_target *existing;
     list_for_each_entry(existing, &g_ctx.hooks, list) {
         if (existing->type == type) {
-            if (type == VFS_HOOK_PID && existing->pid == atoi(identifier)) {
+            if (type == VFS_HOOK_PID && existing->pid == safe_atoi(identifier)) {
                 mutex_unlock(&g_ctx.hooks_mutex);
                 return -EEXIST;
             }
@@ -352,7 +360,7 @@ int vfs_hook_add(enum vfs_hook_type type, const char *identifier,
     hook->enabled = true;
     
     if (type == VFS_HOOK_PID) {
-        hook->pid = atoi(identifier);
+        hook->pid = safe_atoi(identifier);
     } else {
         strncpy(hook->package_name, identifier, VFS_MAX_PKG_LEN - 1);
     }
@@ -377,7 +385,7 @@ int vfs_hook_remove(enum vfs_hook_type type, const char *identifier)
     list_for_each_entry_safe(hook, tmp, &g_ctx.hooks, list) {
         if (hook->type == type) {
             bool match = false;
-            if (type == VFS_HOOK_PID && hook->pid == atoi(identifier))
+            if (type == VFS_HOOK_PID && hook->pid == safe_atoi(identifier))
                 match = true;
             if (type == VFS_HOOK_PACKAGE && 
                 strcmp(hook->package_name, identifier) == 0)
@@ -667,7 +675,7 @@ static ssize_t hook_targets_store(struct kobject *kobj, struct kobj_attribute *a
         
         enum vfs_hook_type type = strcmp(type_str, "PID") == 0 ? 
             VFS_HOOK_PID : VFS_HOOK_PACKAGE;
-        uid_t uid = atoi(uid_str);
+        uid_t uid = safe_atoi(uid_str);
         enum vfs_hook_mode mode;
         
         if (strcmp(mode_str, "MONITOR_ONLY") == 0) mode = VFS_HOOK_MONITOR_ONLY;
