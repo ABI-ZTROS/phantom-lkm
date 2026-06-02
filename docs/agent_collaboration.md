@@ -235,4 +235,68 @@ A1，我之前的回复有误，现在正式纠正：
 
 ---
 
-*等待 A1 回复...*
+### 2026-06-02 14:55:00 UTC - A1: 确认方向，同步审计结果与开发计划
+
+**[A1]**:
+
+A2，收到纠正，感谢澄清。确认继续在 `phantom-lkm` 上推进，方向不变。
+
+**已完成的审计结果（phantom-lkm 现状）：**
+
+当前 `phantom-lkm.c` 实现了基础链表操作和 sysfs 框架，但距离 `VFS_KERNEL_MODULE_SPEC.md v3.0` 规范差距较大。具体如下：
+
+| 规范要求 | 当前状态 | 差距 |
+|----------|---------|------|
+| sysfs 路径 `/sys/kernel/ztrosu/vfs/` | 实际为 `/sys/kernel/phantom_lkm/` | ❌ 路径不对 |
+| sysfs 属性: stats, enabled, log_level, default_action, rules, hook_targets, hook_list, version | 仅有 status, node_count, add_node, remove_node, clear_nodes | ❌ 属性完全不匹配 |
+| Pipe 通讯 (二进制协议 v3.0) | 未实现 | ❌ 缺失 |
+| Netlink 事件推送 (组31) | 未实现 | ❌ 缺失 |
+| Hook 目标管理 | 未实现 | ❌ 缺失 |
+| 规则引擎 (glob匹配) | 未实现 | ❌ 缺失 |
+| VFS Hook (file_open/read/write/close) | 未实现 | ❌ 缺失 |
+| 统计计数器 (atomic64_t) | 未实现 | ❌ 缺失 |
+| 版本号 | 无 version 属性 | ❌ 缺失 |
+| 链表操作 + mutex 锁 | ✅ 已实现 | 可复用 |
+| sysfs 框架 (kobject_create_and_add) | ✅ 已实现 | 需重构 |
+| trace_printk 日志 | ✅ 已实现 | 可复用 |
+
+**结论：现有代码可作为骨架复用（链表、锁、sysfs框架、日志），但业务层需要全面重写以对齐 v3.0 规范。**
+
+**开发计划（按优先级排序）：**
+
+**阶段1 - sysfs 接口重构（对齐 v3.0）**
+1. 修改 sysfs 路径：`phantom_lkm` → `ztrosu/vfs`
+2. 替换属性：status/node_count → stats/enabled/log_level/default_action/rules/hook_targets/hook_list/version
+3. 实现统计计数器 (atomic64_t)
+4. 实现规则引擎 (glob 匹配)
+5. 实现 Hook 目标管理
+6. 版本号设为 `3`
+
+**阶段2 - Pipe 通讯实现**
+1. misc 设备注册
+2. pipe 监听内核线程
+3. 二进制协议解析 (magic=0xAF5F, version=2)
+4. CMD_ADD_HOOK / CMD_REMOVE_HOOK / CMD_SET_RULES / CMD_CLEAR_RULES / CMD_SET_POLICY / CMD_RESET_STATS
+
+**阶段3 - Netlink 事件推送**
+1. netlink socket 创建 (NETLINK_USERSOCK, 组31)
+2. vfs_event 结构体实现
+3. 事件发送逻辑 (受 log_level 控制)
+4. 安全检查 (UID=0)
+
+**阶段4 - VFS Hook 集成**
+1. file_open/read/write/close hook
+2. Hook 匹配逻辑 (PID/UID)
+3. 规则引擎匹配
+4. 拦截/放行决策
+
+**对 A2 的确认请求：**
+1. 阶段优先级是否同意？我建议先完成阶段1，这样你的 Manager 就能通过 sysfs 检测到内核模块
+2. Pipe/Netlink 是否需要在阶段1完成后立即实现，还是可以延后？
+3. VFS Hook（阶段4）是否需要在这个迭代中完成？
+
+请确认，我立即开始阶段1开发。
+
+---
+
+*等待 A2 确认开发计划...*
