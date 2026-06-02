@@ -69,7 +69,7 @@ env:
   KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_version || 'common-android14-6.1-lts' }}
   CLANG_VERSION: ${{ inputs.clang_version || 'clang-r536225' }}
   DEBUG_LEVEL: ${{ inputs.debug_level || '0' }}
-  MODULE_NAME: phantom_lkm
+  MODULE_NAME: aurora_vfs
   OUTPUT_DIR: build-output
   HEADERS_DIR: gki-kernel-headers
   CLANG_DIR: prebuilts/clang/host/linux-x86
@@ -106,7 +106,7 @@ jobs:
             exit 1
           fi
           echo "Source files verified:"
-          ls -la ${{ github.workspace }}/*.{c,h,Makefile} 2>/dev/null
+          ls -la "${{ github.workspace }}/"*.c "${{ github.workspace }}/"*.h "${{ github.workspace }}/Makefile" 2>/dev/null || true
 
       - name: Install build dependencies
         run: |
@@ -269,12 +269,12 @@ jobs:
           
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
           
-          if [ $BUILD_EXIT_CODE -eq 0 ] && [ -f "${SRC_PATH}/phantom_lkm.ko" ]; then
+          if [ $BUILD_EXIT_CODE -eq 0 ] && [ -f "${SRC_PATH}/aurora_vfs.ko" ]; then
             echo "build_success=true" >> "${GITHUB_OUTPUT}"
-            echo "module_path=${SRC_PATH}/phantom_lkm.ko" >> "${GITHUB_OUTPUT}"
-            cp "${SRC_PATH}/phantom_lkm.ko" "${OUTPUT_PATH}/"
+            echo "module_path=${SRC_PATH}/aurora_vfs.ko" >> "${GITHUB_OUTPUT}"
+            cp "${SRC_PATH}/aurora_vfs.ko" "${OUTPUT_PATH}/"
             echo "=== Build successful ==="
-            ls -lh "${OUTPUT_PATH}/phantom_lkm.ko"
+            ls -lh "${OUTPUT_PATH}/aurora_vfs.ko"
           else
             echo "build_success=false" >> "${GITHUB_OUTPUT}"
             echo "ERROR: Build failed with exit code $BUILD_EXIT_CODE"
@@ -284,7 +284,7 @@ jobs:
       - name: Verify module format (ARM64)
         if: success()
         run: |
-          MODULE_FILE="${{ github.workspace }}/${{ env.OUTPUT_DIR }}/phantom_lkm.ko"
+          MODULE_FILE="${{ github.workspace }}/${{ env.OUTPUT_DIR }}/aurora_vfs.ko"
           echo "=== Verifying module format ==="
           file "$MODULE_FILE"
           FILE_INFO=$(file "$MODULE_FILE")
@@ -308,9 +308,9 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: phantom_lkm-sm8650-${{ github.run_id }}
+          name: aurora_vfs-sm8650-${{ github.run_id }}
           path: |
-            ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/phantom_lkm.ko
+            ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/aurora_vfs.ko
             ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/build.log
           if-no-files-found: error
           retention-days: 30
@@ -333,7 +333,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: phantom_lkm-sm8650-${{ github.run_id }}
+          name: aurora_vfs-sm8650-${{ github.run_id }}
           path: ./release-artifacts
 
       - name: Prepare release assets
@@ -344,16 +344,16 @@ jobs:
             VERSION_TAG="manual-$(date +%Y%m%d-%H%M%S)"
           fi
           cd ./release-artifacts
-          [ -f "phantom_lkm.ko" ] && mv phantom_lkm.ko "phantom_lkm-sm8650-${VERSION_TAG}.ko"
+          [ -f "aurora_vfs.ko" ] && mv aurora_vfs.ko "aurora_vfs-sm8650-${VERSION_TAG}.ko"
           sha256sum *.ko > SHA256SUMS.txt
           echo "VERSION_TAG=${VERSION_TAG}" >> "${GITHUB_ENV}"
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION_TAG }}
-          name: "phantom_lkm SM8650 - ${{ env.VERSION_TAG }}"
-          body: |
-            ## OnePlus ACE5 (SM8650) phantom_lkm Kernel Module
+          name: "Aurora VFS SM8650 - ${{ env.VERSION_TAG }}"
+            body: |
+            ## OnePlus ACE5 (SM8650) Aurora VFS Kernel Module
 
             ### Build Information
             - **SoC**: Qualcomm SM8650 (Snapdragon 8 Gen 3)
@@ -364,17 +364,17 @@ jobs:
 
             ### Installation
             ```bash
-            adb push phantom_lkm-sm8650-*.ko /data/local/tmp/
-            adb shell su -c "insmod /data/local/tmp/phantom_lkm-sm8650-*.ko"
-            adb shell su -c "cat /sys/kernel/phantom_lkm/status"
+            adb push aurora_vfs-sm8650-*.ko /data/local/tmp/
+            adb shell su -c "insmod /data/local/tmp/aurora_vfs-sm8650-*.ko"
+            adb shell su -c "cat /sys/kernel/ztrosu/vfs/version"
             ```
 
             ### Trace Output
             ```bash
-            adb shell su -c "cat /sys/kernel/tracing/trace | grep phantom_lkm"
+            adb shell su -c "cat /sys/kernel/tracing/trace | grep aurora_vfs"
             ```
           files: |
-            ./release-artifacts/phantom_lkm-sm8650-*.ko
+            ./release-artifacts/aurora_vfs-sm8650-*.ko
             ./release-artifacts/SHA256SUMS.txt
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
