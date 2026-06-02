@@ -37,13 +37,13 @@ on:
       clang_version:
         description: 'Clang toolchain version'
         required: false
-        default: 'clang-r536225'
+        default: 'clang-r510928'
         type: choice
         options:
-          - 'clang-r536225'
-          - 'clang-r530567'
-          - 'clang-r522817'
           - 'clang-r510928'
+          - 'clang-r522817'
+          - 'clang-r530567'
+          - 'clang-r536225'
       debug_level:
         description: 'Module debug level (0=none, 1=basic, 2=verbose)'
         required: false
@@ -67,7 +67,7 @@ permissions:
 
 env:
   KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_version || 'common-android14-6.1-lts' }}
-  CLANG_VERSION: ${{ inputs.clang_version || 'clang-r536225' }}
+  CLANG_VERSION: ${{ inputs.clang_version || 'clang-r510928' }}
   DEBUG_LEVEL: ${{ inputs.debug_level || '0' }}
   MODULE_NAME: aurora_vfs
   OUTPUT_DIR: build-output
