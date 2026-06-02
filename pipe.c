@@ -7,6 +7,7 @@
  */
 
 #include "phantom_lkm.h"
+#include <linux/sched.h>    /* current */
 
 /* ==================== 全局变量 ==================== */
 
