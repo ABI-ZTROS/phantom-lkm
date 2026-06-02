@@ -108,69 +108,24 @@ jobs:
           echo "Source files verified:"
           ls -la "${{ github.workspace }}/"*.c "${{ github.workspace }}/"*.h "${{ github.workspace }}/Makefile" 2>/dev/null || true
 
-      - name: Install build dependencies
+      - name: Install build dependencies and Clang
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison curl flex git \
             libelf-dev libssl-dev openssl \
             python3 rsync unzip wget xz-utils \
-            zlib1g-dev file ccache
-
-      - name: Cache Clang/LLVM toolchain
-        if: ${{ inputs.skip_cache != true }}
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/${{ env.CLANG_DIR }}
-          key: clang-toolchain-${{ env.CLANG_VERSION }}-${{ runner.os }}
-          restore-keys: |
-            clang-toolchain-${{ env.CLANG_VERSION }}-
-
-      - name: Download Android Clang toolchain
-        if: steps.cache-clang.outputs.cache-hit != 'true' || inputs.skip_cache == true
-        timeout-minutes: 15
-        run: |
-          set -euxo pipefail
-          CLANG_PATH="${{ github.workspace }}/${{ env.CLANG_DIR }}"
+            zlib1g-dev file ccache \
+            clang-18 lld-18 llvm-18 \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
           
-          echo "=== Downloading Clang ${{ env.CLANG_VERSION }} ==="
-          mkdir -p "$CLANG_PATH"
-          rm -rf "${CLANG_PATH:?}/${{ env.CLANG_VERSION }}"
+          # 设置 Clang 路径
+          echo "CLANG_BIN=/usr/bin" >> "${GITHUB_ENV}"
+          echo "PATH=/usr/bin:${PATH}" >> "${GITHUB_ENV}"
           
-          # AOSP Clang tarball URL (直接下载，不走 git clone)
-          # 格式: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ env.CLANG_VERSION }}.tar.gz
-          CLANG_TARBALL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${{ env.CLANG_VERSION }}.tar.gz"
-          
-          # 备用: AOSP CI builds
-          # CLANG_TARBALL="https://ci.android.com/builds/submitted/9750374/latest/clang/${{ env.CLANG_VERSION }}.tar.gz"
-          
-          echo "Downloading from: $CLANG_TARBALL"
-          curl -sSL "$CLANG_TARBALL" -o /tmp/clang.tar.gz || {
-            echo "Primary URL failed, trying fallback..."
-            # Fallback: 使用 AOSP 预编译镜像
-            CLANG_TARBALL="https://dl.google.com/android/repository/${{ env.CLANG_VERSION }}-linux.tar.gz"
-            curl -sSL "$CLANG_TARBALL" -o /tmp/clang.tar.gz
-          }
-          
-          mkdir -p "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
-          tar -xzf /tmp/clang.tar.gz -C "${CLANG_PATH}/${{ env.CLANG_VERSION }}"
-          rm /tmp/clang.tar.gz
-          
-          echo "Clang downloaded:"
-          ls "${CLANG_PATH}/${{ env.CLANG_VERSION }}/bin/" | head -10
-
-      - name: Verify Clang installation
-        run: |
-          CLANG_BIN="${{ github.workspace }}/${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}/bin"
-          if [ ! -f "${CLANG_BIN}/clang" ]; then
-            echo "ERROR: clang not found at ${CLANG_BIN}/clang"
-            exit 1
-          fi
-          "${CLANG_BIN}/clang" --version | head -3
-          echo "CLANG_PATH=${{ github.workspace }}/${{ env.CLANG_DIR }}/${{ env.CLANG_VERSION }}" >> "${GITHUB_ENV}"
-          echo "CLANG_BIN=${CLANG_BIN}" >> "${GITHUB_ENV}"
-          echo "PATH=${CLANG_BIN}:${PATH}" >> "${GITHUB_ENV}"
+          # 验证 Clang
+          clang-18 --version || clang --version
+          aarch64-linux-gnu-gcc --version | head -1
 
       - name: Cache GKI kernel headers
         if: ${{ inputs.skip_cache != true }}
@@ -260,23 +215,23 @@ jobs:
           set -exuo pipefail
           
           HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
-          CLANG_BIN="${{ env.CLANG_BIN }}"
           SRC_PATH="${{ github.workspace }}"
           OUTPUT_PATH="${{ github.workspace }}/${{ env.OUTPUT_DIR }}"
           
           mkdir -p "$OUTPUT_PATH"
           
+          # 使用 apt 安装的 clang-18 + gcc-aarch64-linux-gnu 交叉编译
           make -C "$SRC_PATH" \
             KDIR="$HEADERS_PATH" \
             ARCH=arm64 \
-            CROSS_COMPILE="${CLANG_BIN}/aarch64-linux-gnu-" \
-            CC="${CLANG_BIN}/clang" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC=clang-18 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
-            LD="${CLANG_BIN}/ld.lld" \
-            AR="${CLANG_BIN}/llvm-ar" \
-            NM="${CLANG_BIN}/llvm-nm" \
-            OBJCOPY="${CLANG_BIN}/llvm-objcopy" \
-            STRIP="${CLANG_BIN}/llvm-strip" \
+            LD=lld-18 \
+            AR=llvm-ar-18 \
+            NM=llvm-nm-18 \
+            OBJCOPY=llvm-objcopy-18 \
+            STRIP=llvm-strip-18 \
             DEBUG_LEVEL="${{ env.DEBUG_LEVEL }}" \
             V=1 \
             2>&1 | tee "${OUTPUT_PATH}/build.log"
