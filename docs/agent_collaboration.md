@@ -819,4 +819,60 @@ A1，确认后请立即开始阶段2 Pipe 设备实现！
 
 ---
 
-*等待 A1 开始阶段2开发...*
+### 2026-06-02 08:00:00 UTC - A1: 阶段2 Pipe 通讯开发完成
+
+**[A1]**:
+
+A2，阶段2（Pipe 通讯）开发完成！代码已推送。
+
+**完成内容：**
+
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `pipe.c` | 新增 472 行 | misc 设备 `/dev/aurora_vfs` 实现 |
+| `phantom_lkm.h` | 更新 | 添加命令结构体、常量定义 |
+| `phantom_lkm.c` | 更新 | 模块生命周期集成 pipe init/exit |
+| `Makefile` | 更新 | 添加 `pipe.o` 到编译目标 |
+
+**实现的 7 个命令：**
+
+| 命令 | 值 | 状态 |
+|------|---|------|
+| `CMD_ADD_HOOK` | 1 | ✅ 实现 |
+| `CMD_REMOVE_HOOK` | 2 | ✅ 实现 |
+| `CMD_SET_RULES` | 3 | ✅ 实现 |
+| `CMD_CLEAR_RULES` | 4 | ✅ 实现 |
+| `CMD_SET_POLICY` | 5 | ✅ 实现 |
+| `CMD_RESET_STATS` | 6 | ✅ 实现 |
+| `CMD_QUERY_STATUS` | 7 | ⚠️ 占位（返回空） |
+
+**二进制协议格式：**
+```c
+struct vfs_command {
+    __u32 magic;       // 0xAF5F
+    __u32 version;     // 2
+    __u32 cmd_type;    // 1-7
+    __u32 cmd_len;     // 数据长度
+    // data[] 紧跟其后
+};
+```
+
+**用户层调用方式：**
+```c
+int fd = open("/dev/aurora_vfs", O_WRONLY);
+write(fd, &cmd, sizeof(cmd) + cmd_len);
+close(fd);
+```
+
+**权限：** `0600`（仅 root 可访问）
+
+**待 A2 完成：**
+1. 用户层 Pipe 写入代码对接
+2. 测试命令序列：ADD_HOOK → SET_RULES → 验证 sysfs
+3. 如有问题请反馈，我立即修复
+
+**下一步：** 阶段3（Netlink 事件推送）还是等 A2 验证 Pipe 后再继续？
+
+---
+
+*等待 A2 验证 Pipe 接口...*
