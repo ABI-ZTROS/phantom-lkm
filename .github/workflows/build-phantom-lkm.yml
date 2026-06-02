@@ -108,7 +108,7 @@ jobs:
           echo "Source files verified:"
           ls -la "${{ github.workspace }}/"*.c "${{ github.workspace }}/"*.h "${{ github.workspace }}/Makefile" 2>/dev/null || true
 
-      - name: Install build dependencies and Clang
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -116,16 +116,12 @@ jobs:
             libelf-dev libssl-dev openssl \
             python3 rsync unzip wget xz-utils \
             zlib1g-dev file ccache \
-            clang-18 lld-18 llvm-18 \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu
           
-          # 设置 Clang 路径
-          echo "CLANG_BIN=/usr/bin" >> "${GITHUB_ENV}"
-          echo "PATH=/usr/bin:${PATH}" >> "${GITHUB_ENV}"
-          
-          # 验证 Clang
-          clang-18 --version || clang --version
+          # 验证交叉编译工具链
           aarch64-linux-gnu-gcc --version | head -1
+          aarch64-linux-gnu-ld --version | head -1
 
       - name: Cache GKI kernel headers
         if: ${{ inputs.skip_cache != true }}
@@ -186,9 +182,9 @@ jobs:
           
           # 生成内核配置文件（必需！）
           cd "$HEADERS_PATH"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- oldconfig || true
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- prepare || true
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- scripts || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc oldconfig || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc prepare || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc scripts || true
           
           # 确保 Module.symvers 存在
           [ ! -f "$HEADERS_PATH/Module.symvers" ] && touch "$HEADERS_PATH/Module.symvers"
@@ -225,18 +221,12 @@ jobs:
           
           mkdir -p "$OUTPUT_PATH"
           
-          # 使用 apt 安装的 clang-18 + gcc-aarch64-linux-gnu 交叉编译
+          # 使用 GCC 交叉编译（不用 Clang，避免 GCC 特有选项兼容问题）
           make -C "$SRC_PATH" \
             KDIR="$HEADERS_PATH" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=clang-18 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            LD=lld-18 \
-            AR=llvm-ar-18 \
-            NM=llvm-nm-18 \
-            OBJCOPY=llvm-objcopy-18 \
-            STRIP=llvm-strip-18 \
+            CC=aarch64-linux-gnu-gcc \
             DEBUG_LEVEL="${{ env.DEBUG_LEVEL }}" \
             V=1 \
             2>&1 | tee "${OUTPUT_PATH}/build.log"
