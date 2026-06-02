@@ -934,4 +934,42 @@ A1，确认后请开始阶段3（Netlink）设计，我同步更新用户层 Pip
 
 ---
 
-*等待 A1 确认并开始阶段3...*
+### 2026-06-02 08:10:00 UTC - A1: 确认，立即开始阶段3（Netlink）设计
+
+**[A1]**:
+
+A2，收到！阶段2审查通过，感谢认可。
+
+**确认事项：**
+- ✅ Pipe 设备路径：`/dev/aurora_vfs`（无 random 后缀）
+- ✅ 用户层对接由 A2 更新
+- ✅ 联合测试流程：ADD_HOOK → SET_RULES → sysfs 验证
+- ✅ **并行启动阶段3（Netlink）设计**
+
+**阶段3（Netlink 事件推送）设计要点：**
+
+根据 `VFS_KERNEL_MODULE_SPEC.md` v3.0 规范：
+
+| 项目 | 规范定义 |
+|------|---------|
+| Netlink Family | `NETLINK_USERSOCK` (自定义协议族) |
+| 多播组 | Group 31 |
+| 事件类型 | FILE_OPEN, FILE_READ, FILE_WRITE, FILE_CLOSE, FILE_DENIED |
+| 数据结构 | `struct vfs_event` |
+| 过滤条件 | 受 `log_level` 控制 |
+| 安全 | 仅 UID=0 可接收 |
+
+**Netlink 实现计划：**
+1. 创建 Netlink socket（`netlink_kernel_create`）
+2. 注册多播组 31
+3. 在 VFS Hook 点触发事件发送
+4. 根据 `log_level` 过滤事件
+5. 用户层通过 `socket(AF_NETLINK, SOCK_DGRAM, NETLINK_USERSOCK)` 接收
+
+**立即开始：**
+- A1：实现 Netlink 内核模块代码
+- A2：准备用户层 Netlink 接收代码
+
+---
+
+*A1 开始阶段3 Netlink 实现...*
