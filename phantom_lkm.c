@@ -701,14 +701,12 @@ static ssize_t hook_targets_store(struct kobject *kobj, struct kobj_attribute *a
     return count;
 }
 
-/* hook_list (0444) */
+/* hook_list (0444) - 冒号分隔格式，与用户层 getHookList() 兼容 */
 static ssize_t hook_list_show(struct kobject *kobj, struct kobj_attribute *attr,
                               char *buf)
 {
     struct vfs_hook_target *hook;
-    int len = 0, idx = 1;
-    
-    len += sprintf(buf + len, "# ID    TYPE     IDENTIFIER          UID    MODE           ENABLED\n");
+    int len = 0;
     
     mutex_lock(&g_ctx.hooks_mutex);
     
@@ -726,14 +724,13 @@ static ssize_t hook_list_show(struct kobject *kobj, struct kobj_attribute *attr,
         default: mode_str = "UNKNOWN"; break;
         }
         
-        len += sprintf(buf + len, "%04d   %-8s %-19s %6u  %-14s %s\n",
-                      idx, type_str, id_str, hook->uid, mode_str,
-                      hook->enabled ? "yes" : "no");
+        len += sprintf(buf + len, "%s:%s:%u:%s:%d\n",
+                      type_str, id_str, hook->uid, mode_str,
+                      hook->enabled ? 1 : 0);
         
         if (hook->type == VFS_HOOK_PID)
             kfree(id_str);
         
-        idx++;
         if (len >= PAGE_SIZE - 100)
             break;
     }

@@ -352,7 +352,7 @@ jobs:
         with:
           tag_name: ${{ env.VERSION_TAG }}
           name: "Aurora VFS SM8650 - ${{ env.VERSION_TAG }}"
-            body: |
+          body: |
             ## OnePlus ACE5 (SM8650) Aurora VFS Kernel Module
 
             ### Build Information
