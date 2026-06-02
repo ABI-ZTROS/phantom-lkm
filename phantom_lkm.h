@@ -20,6 +20,9 @@
 #include <linux/types.h>
 #include <linux/atomic.h>
 #include <linux/ktime.h>
+#include <linux/miscdevice.h>   /* miscdevice */
+#include <linux/fs.h>           /* file_operations */
+#include <linux/uaccess.h>      /* copy_from_user */
 
 /* trace_printk 头文件（某些内核配置中不存在） */
 #if defined(CONFIG_TRACE_PRINTK) || defined(CONFIG_FTRACE)
@@ -54,6 +57,15 @@
 #define VFS_PIPE_TIMEOUT_MS    5000    /* Pipe超时 (毫秒) */
 #define VFS_PIPE_NAME_PREFIX   "aurora_vfs_"
 #define VFS_PIPE_PATH_LEN      32
+
+/* Pipe命令类型 */
+#define CMD_ADD_HOOK           1   /* 添加Hook目标 */
+#define CMD_REMOVE_HOOK        2   /* 移除Hook目标 */
+#define CMD_SET_RULES          3   /* 批量设置规则 */
+#define CMD_CLEAR_RULES        4   /* 清空规则 */
+#define CMD_SET_POLICY         5   /* 设置策略 */
+#define CMD_RESET_STATS        6   /* 重置统计 */
+#define CMD_QUERY_STATUS       7   /* 查询状态 */
 
 /* v3 新增 - Netlink通讯 */
 #define AURORA_VFS_NL_FAMILY   NETLINK_USERSOCK
@@ -129,6 +141,41 @@ struct vfs_policy {
     enum vfs_action     default_action;     /* 默认动作 */
 };
 
+/* ==================== Pipe命令数据结构 ==================== */
+
+/* 命令协议头 (16字节) */
+struct vfs_command {
+    __u32 magic;       /* 0xAF5F */
+    __u32 version;     /* 2 */
+    __u32 cmd_type;    /* 命令类型 */
+    __u32 cmd_len;     /* 数据长度 */
+    /* 后面紧跟 data[] */
+};
+
+/* CMD_ADD_HOOK 数据 */
+struct cmd_add_hook {
+    __u8  hook_type;        /* 0=PID, 1=PACKAGE */
+    __u32 identifier_len;   /* identifier字符串长度 */
+    /* 后面紧跟 identifier[] (变长) */
+    /* 然后是 uid (__u32) */
+    /* 然后是 hook_mode (__u8) */
+};
+
+/* CMD_REMOVE_HOOK 数据 */
+struct cmd_remove_hook {
+    __u8  hook_type;        /* 0=PID, 1=PACKAGE */
+    __u32 identifier_len;   /* identifier字符串长度 */
+    /* 后面紧跟 identifier[] (变长) */
+};
+
+/* CMD_SET_POLICY 数据 */
+struct cmd_set_policy {
+    __u8  enabled;          /* 0或1 */
+    __u8  log_level;        /* 0-5 */
+    __u8  default_action;   /* 0=allow, 1=deny */
+    __u8  reserved;         /* 对齐填充 */
+};
+
 /* 全局上下文 */
 struct vfs_debug_ctx {
     /* sysfs */
@@ -155,7 +202,7 @@ struct vfs_debug_ctx {
     struct sock         *nlsk;
     
     /* v3 新增 - Pipe (阶段2实现) */
-    struct task_struct  *pipe_thread;
+    struct miscdevice   pipe_misc;          /* misc设备 */
 };
 
 /* ==================== 规则引擎接口 ==================== */
@@ -277,6 +324,27 @@ int vfs_sysfs_init(void);
  * vfs_sysfs_exit - 注销sysfs接口
  */
 void vfs_sysfs_exit(void);
+
+/* ==================== Pipe接口 ==================== */
+
+/**
+ * vfs_pipe_init - 初始化Pipe通讯 (misc设备)
+ * @return: 成功返回0
+ */
+int vfs_pipe_init(void);
+
+/**
+ * vfs_pipe_exit - 注销Pipe通讯
+ */
+void vfs_pipe_exit(void);
+
+/**
+ * vfs_pipe_process_command - 处理Pipe命令
+ * @cmd: 命令结构体指针
+ * @data: 命令数据指针
+ * @return: 成功返回0
+ */
+int vfs_pipe_process_command(struct vfs_command *cmd, void *data);
 
 /* ==================== 调试输出宏 ==================== */
 

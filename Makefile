@@ -7,9 +7,9 @@
 # 模块名称
 MODULE_NAME := aurora_vfs
 
-# 源文件 (保持 phantom_lkm.c 文件名，输出 aurora_vfs.ko)
+# 源文件 (输出 aurora_vfs.ko)
 obj-m += $(MODULE_NAME).o
-$(MODULE_NAME)-objs := phantom_lkm.o
+$(MODULE_NAME)-objs := phantom_lkm.o pipe.o
 
 # 默认内核源码路径（可通过KDIR参数覆盖）
 KDIR ?= /lib/modules/$(shell uname -r)/build
