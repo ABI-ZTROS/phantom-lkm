@@ -180,14 +180,30 @@ jobs:
             --exclude='*.o' --exclude='*.ko' \
             "$KERNEL_SRC/" "$HEADERS_PATH/"
           
-          # 生成内核配置文件（必需！）
+          # 生成内核配置文件和 Module.symvers（必需！）
           cd "$HEADERS_PATH"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc oldconfig || true
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc oldconfig </dev/null || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc prepare || true
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc scripts || true
           
-          # 确保 Module.symvers 存在
-          [ ! -f "$HEADERS_PATH/Module.symvers" ] && touch "$HEADERS_PATH/Module.symvers"
+          # modules_prepare 是关键：它会生成 Module.symvers 和 modpost 所需的所有文件
+          # 这一步不能跳过，否则外部模块编译会因缺少内核符号而失败
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc modules_prepare || {
+            echo "WARNING: modules_prepare failed, trying alternative..."
+            # 如果 modules_prepare 失败，尝试只编译核心模块来生成符号
+            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc M=init/ modules || true
+          }
+          
+          # 验证 Module.symvers 是否有内容
+          if [ ! -s "$HEADERS_PATH/Module.symvers" ]; then
+            echo "ERROR: Module.symvers is still empty after modules_prepare!"
+            echo "Kernel symbols needed for external module compilation are missing."
+            echo "Checking if kernel config exists..."
+            ls -la "$HEADERS_PATH/.config" 2>/dev/null || echo "No .config found"
+            ls -la "$HEADERS_PATH/Module.symvers" 2>/dev/null || echo "No Module.symvers found"
+            # 不再静默跳过，让构建失败以便诊断
+            exit 1
+          fi
           
           echo "Headers prepared:"
           ls -la "$HEADERS_PATH/include/config/auto.conf" || echo "auto.conf not found (will be generated on first build)"
