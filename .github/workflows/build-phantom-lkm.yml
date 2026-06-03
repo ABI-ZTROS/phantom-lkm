@@ -70,6 +70,33 @@ jobs:
           echo "=== Verifying source files ==="
           ls -la *.c *.h Makefile 2>/dev/null || true
 
+      - name: Diagnose DDK environment
+        run: |
+          echo "=========================================="
+          echo "  DDK Environment Diagnostics"
+          echo "=========================================="
+          echo "--- uname ---"
+          uname -a
+          echo "--- env (kernel related) ---"
+          env | grep -iE 'kernel|kdir|cc|clang|cross|arch' || true
+          echo "--- /lib/modules/ ---"
+          ls -la /lib/modules/ 2>/dev/null || true
+          echo "--- /usr/src/ ---"
+          ls -la /usr/src/ 2>/dev/null || true
+          echo "--- which clang ---"
+          which clang 2>/dev/null || true
+          clang --version 2>/dev/null || true
+          echo "--- which make ---"
+          which make
+          make --version | head -2
+          echo "--- DDK specific paths ---"
+          ls -la /ddk 2>/dev/null || true
+          ls -la /kernel 2>/dev/null || true
+          ls -la /workspace 2>/dev/null || true
+          echo "--- Check for Module.symvers ---"
+          find / -name "Module.symvers" 2>/dev/null | head -5 || true
+          echo "=========================================="
+
       - name: Build aurora_vfs.ko
         id: build
         run: |
@@ -80,7 +107,15 @@ jobs:
           # DDK 环境中 CC=clang, 使用内核构建系统
           # KERNELDIR 环境变量由 DDK 容器设置
           cd $GITHUB_WORKSPACE
-          make CC=clang ARCH=arm64 2>&1 | tee build.log
+
+          # 如果容器有 KERNELDIR 环境变量，显式传递
+          if [ -n "${KERNELDIR:-}" ]; then
+            echo "Using KERNELDIR=$KERNELDIR"
+            make CC=clang ARCH=arm64 KDIR="$KERNELDIR" 2>&1 | tee build.log
+          else
+            echo "KERNELDIR not set, using Makefile default"
+            make CC=clang ARCH=arm64 2>&1 | tee build.log
+          fi
 
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
 
