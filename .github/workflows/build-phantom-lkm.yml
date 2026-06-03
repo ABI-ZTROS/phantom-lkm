@@ -1,16 +1,14 @@
 # =============================================================================
 # build-phantom-lkm.yml
 # =============================================================================
-# Build OnePlus ACE5 (SM8650) phantom_lkm Kernel Module (.ko)
-# Target: Android GKI 6.1 ARM64
+# Build Aurora VFS Kernel Module (.ko) using DDK (Device Driver Kit)
+# Target: Android GKI 6.1 ARM64 (OnePlus ACE5 SM8650)
 #
-# Triggers:
-#   - Push to master/main branch (when source files change)
-#   - Manual workflow_dispatch with configurable parameters
-#   - Tag push (v*) for automatic release creation
+# Uses prebuilt DDK Docker image (same approach as KernelSU)
+# The DDK image contains: kernel headers + Module.symvers + toolchain
 # =============================================================================
 
-name: Build phantom_lkm (SM8650)
+name: Build aurora_vfs (SM8650)
 
 on:
   push:
@@ -21,42 +19,25 @@ on:
       - '*.h'
       - 'Makefile'
       - '.github/workflows/build-phantom-lkm.yml'
-      - '.github/workflows/update-kernel-headers.yml'
   workflow_dispatch:
     inputs:
-      kernel_version:
-        description: 'GKI kernel version manifest branch'
+      kmi:
+        description: 'GKI KMI version'
         required: false
-        default: 'common-android14-6.1-lts'
+        default: 'android14-6.1'
         type: choice
         options:
-          - 'common-android14-6.1-lts'
-          - 'common-android14-6.1'
-          - 'common-android15-6.6-lts'
-          - 'common-android15-6.6'
-      clang_version:
-        description: 'Clang toolchain version'
+          - 'android14-6.1'
+          - 'android15-6.6'
+          - 'android14-5.15'
+          - 'android15-5.15'
+      ddk_release:
+        description: 'DDK release date'
         required: false
-        default: 'clang-r510928'
-        type: choice
-        options:
-          - 'clang-r510928'
-          - 'clang-r522817'
-          - 'clang-r530567'
-          - 'clang-r536225'
-      debug_level:
-        description: 'Module debug level (0=none, 1=basic, 2=verbose)'
-        required: false
-        default: '0'
-        type: choice
-        options: ['0', '1', '2']
+        default: '20260313'
+        type: string
       create_release:
         description: 'Create GitHub Release with artifacts'
-        required: false
-        default: false
-        type: boolean
-      skip_cache:
-        description: 'Skip cache and force re-download dependencies'
         required: false
         default: false
         type: boolean
@@ -66,195 +47,57 @@ permissions:
   actions: write
 
 env:
-  KERNEL_MANIFEST_BRANCH: ${{ inputs.kernel_version || 'common-android14-6.1-lts' }}
-  CLANG_VERSION: ${{ inputs.clang_version || 'clang-r510928' }}
-  DEBUG_LEVEL: ${{ inputs.debug_level || '0' }}
+  KMI: ${{ inputs.kmi || 'android14-6.1' }}
+  DDK_RELEASE: ${{ inputs.ddk_release || '20260313' }}
   MODULE_NAME: aurora_vfs
   OUTPUT_DIR: build-output
-  HEADERS_DIR: gki-kernel-headers
-  CLANG_DIR: prebuilts/clang/host/linux-x86
 
 jobs:
   build-module:
-    name: Build phantom_lkm.ko (SM8650)
+    name: Build aurora_vfs.ko (${{ env.KMI }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ env.KMI }}-${{ env.DDK_RELEASE }}
+      options: --privileged
 
     outputs:
       build_success: ${{ steps.build.outputs.build_success }}
       module_path: ${{ steps.build.outputs.module_path }}
-      kernel_branch: ${{ env.KERNEL_MANIFEST_BRANCH }}
-      clang_version: ${{ env.CLANG_VERSION }}
+      kmi: ${{ env.KMI }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Verify source files
-        id: verify-source
         run: |
           echo "=== Verifying source files ==="
-          if [ ! -f "${{ github.workspace }}/phantom_lkm.c" ]; then
-            echo "ERROR: phantom_lkm.c not found!"
-            ls -la ${{ github.workspace }}/
-            exit 1
-          fi
-          if [ ! -f "${{ github.workspace }}/Makefile" ]; then
-            echo "ERROR: Makefile not found!"
-            exit 1
-          fi
-          echo "Source files verified:"
-          ls -la "${{ github.workspace }}/"*.c "${{ github.workspace }}/"*.h "${{ github.workspace }}/Makefile" 2>/dev/null || true
+          ls -la *.c *.h Makefile 2>/dev/null || true
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison curl flex git \
-            libelf-dev libssl-dev openssl \
-            python3 rsync unzip wget xz-utils \
-            zlib1g-dev file ccache \
-            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu
-          
-          # 验证交叉编译工具链
-          aarch64-linux-gnu-gcc --version | head -1
-          aarch64-linux-gnu-ld --version | head -1
-
-      - name: Cache GKI kernel headers
-        if: ${{ inputs.skip_cache != true }}
-        id: cache-headers
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/${{ env.HEADERS_DIR }}
-          key: gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-${{ hashFiles('Makefile') }}-${{ runner.os }}
-          restore-keys: |
-            gki-headers-${{ env.KERNEL_MANIFEST_BRANCH }}-
-
-      - name: Install repo tool
-        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
-        run: |
-          mkdir -p "${{ github.workspace }}/bin"
-          curl -sL https://storage.googleapis.com/git-repo-downloads/repo \
-            -o "${{ github.workspace }}/bin/repo"
-          chmod +x "${{ github.workspace }}/bin/repo"
-          echo "${{ github.workspace }}/bin" >> "${GITHUB_PATH}"
-
-      - name: Download GKI kernel source
-        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
-        timeout-minutes: 30
-        run: |
-          set -euxo pipefail
-          rm -rf "${{ github.workspace }}/android-kernel"
-          mkdir -p "${{ github.workspace }}/android-kernel"
-          cd "${{ github.workspace }}/android-kernel"
-          
-          repo init \
-            -u https://android.googlesource.com/kernel/manifest \
-            -b "${{ env.KERNEL_MANIFEST_BRANCH }}" \
-            --depth=1
-          
-          repo sync -c -j"$(nproc --all)" --fail-fast --no-tags --force-sync --current-branch
-
-      - name: Extract and prepare kernel headers
-        if: steps.cache-headers.outputs.cache-hit != 'true' || inputs.skip_cache == true
-        run: |
-          set -euxo pipefail
-          KERNEL_SRC="${{ github.workspace }}/android-kernel/common"
-          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
-          
-          if [ ! -d "$KERNEL_SRC" ]; then
-            echo "ERROR: Kernel source not found at $KERNEL_SRC"
-            ls -la "${{ github.workspace }}/android-kernel/" || true
-            exit 1
-          fi
-          
-          rm -rf "$HEADERS_PATH"
-          mkdir -p "$HEADERS_PATH"
-          
-          # 复制完整内核源码（不只是 headers，需要配置文件）
-          rsync -a --delete \
-            --exclude='.git' \
-            --exclude='*.o' --exclude='*.ko' \
-            "$KERNEL_SRC/" "$HEADERS_PATH/"
-          
-          # 生成内核配置文件和 Module.symvers（必需！）
-          cd "$HEADERS_PATH"
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc oldconfig </dev/null || true
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc prepare || true
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc scripts || true
-          
-          # modules_prepare 是关键：它会生成 Module.symvers 和 modpost 所需的所有文件
-          # 这一步不能跳过，否则外部模块编译会因缺少内核符号而失败
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc modules_prepare || {
-            echo "WARNING: modules_prepare failed, trying alternative..."
-            # 如果 modules_prepare 失败，尝试只编译核心模块来生成符号
-            make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=aarch64-linux-gnu-gcc M=init/ modules || true
-          }
-          
-          # 验证 Module.symvers 是否有内容
-          if [ ! -s "$HEADERS_PATH/Module.symvers" ]; then
-            echo "ERROR: Module.symvers is still empty after modules_prepare!"
-            echo "Kernel symbols needed for external module compilation are missing."
-            echo "Checking if kernel config exists..."
-            ls -la "$HEADERS_PATH/.config" 2>/dev/null || echo "No .config found"
-            ls -la "$HEADERS_PATH/Module.symvers" 2>/dev/null || echo "No Module.symvers found"
-            # 不再静默跳过，让构建失败以便诊断
-            exit 1
-          fi
-          
-          echo "Headers prepared:"
-          ls -la "$HEADERS_PATH/include/config/auto.conf" || echo "auto.conf not found (will be generated on first build)"
-          file "$HEADERS_PATH/scripts/mod/modpost" || echo "modpost not built"
-          
-          echo "Headers extracted: $(du -sh "$HEADERS_PATH" | cut -f1)"
-
-      - name: Verify kernel headers integrity
-        run: |
-          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
-          MISSING=0
-          for f in Makefile arch/arm64/Makefile include/linux/module.h include/linux/kernel.h scripts/Makefile.modpost; do
-            if [ ! -f "$HEADERS_PATH/$f" ]; then
-              echo "ERROR: Missing $f"
-              MISSING=$((MISSING + 1))
-            else
-              echo "OK: $f"
-            fi
-          done
-          [ $MISSING -gt 0 ] && { echo "ERROR: $MISSING files missing!"; exit 1; }
-          echo "Headers integrity check passed"
-
-      - name: Build phantom_lkm.ko
+      - name: Build aurora_vfs.ko
         id: build
         run: |
           set -exuo pipefail
-          
-          HEADERS_PATH="${{ github.workspace }}/${{ env.HEADERS_DIR }}"
-          SRC_PATH="${{ github.workspace }}"
-          OUTPUT_PATH="${{ github.workspace }}/${{ env.OUTPUT_DIR }}"
-          
-          mkdir -p "$OUTPUT_PATH"
-          
-          # 使用 GCC 交叉编译（不用 Clang，避免 GCC 特有选项兼容问题）
-          make -C "$SRC_PATH" \
-            KDIR="$HEADERS_PATH" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CC=aarch64-linux-gnu-gcc \
-            DEBUG_LEVEL="${{ env.DEBUG_LEVEL }}" \
-            V=1 \
-            2>&1 | tee "${OUTPUT_PATH}/build.log"
-          
+
+          echo "=== Building aurora_vfs.ko for KMI: ${{ env.KMI }} ==="
+
+          # DDK 环境中 CC=clang, 使用内核构建系统
+          cd $GITHUB_WORKSPACE
+          make CC=clang 2>&1 | tee build.log
+
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
-          
-          if [ $BUILD_EXIT_CODE -eq 0 ] && [ -f "${SRC_PATH}/aurora_vfs.ko" ]; then
+
+          if [ $BUILD_EXIT_CODE -eq 0 ] && [ -f "aurora_vfs.ko" ]; then
             echo "build_success=true" >> "${GITHUB_OUTPUT}"
-            echo "module_path=${SRC_PATH}/aurora_vfs.ko" >> "${GITHUB_OUTPUT}"
-            cp "${SRC_PATH}/aurora_vfs.ko" "${OUTPUT_PATH}/"
+            echo "module_path=$GITHUB_WORKSPACE/aurora_vfs.ko" >> "${GITHUB_OUTPUT}"
+
+            mkdir -p $GITHUB_WORKSPACE/${{ env.OUTPUT_DIR }}
+            cp aurora_vfs.ko $GITHUB_WORKSPACE/${{ env.OUTPUT_DIR }}/
+
             echo "=== Build successful ==="
-            ls -lh "${OUTPUT_PATH}/aurora_vfs.ko"
+            ls -lh aurora_vfs.ko
+            modinfo aurora_vfs.ko || true
           else
             echo "build_success=false" >> "${GITHUB_OUTPUT}"
             echo "ERROR: Build failed with exit code $BUILD_EXIT_CODE"
@@ -264,34 +107,26 @@ jobs:
       - name: Verify module format (ARM64)
         if: success()
         run: |
-          MODULE_FILE="${{ github.workspace }}/${{ env.OUTPUT_DIR }}/aurora_vfs.ko"
-          echo "=== Verifying module format ==="
-          file "$MODULE_FILE"
-          FILE_INFO=$(file "$MODULE_FILE")
-          echo "$FILE_INFO" | grep -q "ARM aarch64" || { echo "ERROR: Not ARM64!"; exit 1; }
+          file aurora_vfs.ko
+          file aurora_vfs.ko | grep -q "ARM aarch64" || { echo "ERROR: Not ARM64!"; exit 1; }
           echo "Module format verified: ARM64 relocatable"
 
       - name: Output error log on failure
-        if: failure() && steps.build.outcome == 'failure'
+        if: failure()
         run: |
           echo "=========================================="
           echo "  BUILD FAILED - Diagnostic Information"
           echo "=========================================="
-          OUTPUT_PATH="${{ github.workspace }}/${{ env.OUTPUT_DIR }}"
-          [ -f "${OUTPUT_PATH}/build.log" ] && tail -150 "${OUTPUT_PATH}/build.log"
-          echo ""
-          echo "--- Suggestions ---"
-          echo "1. Try 'skip_cache: true' to refresh dependencies"
-          echo "2. Check kernel version compatibility (6.1 GKI)"
+          [ -f build.log ] && tail -150 build.log
 
-      - name: Upload phantom_lkm.ko artifact
+      - name: Upload aurora_vfs.ko artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: aurora_vfs-sm8650-${{ github.run_id }}
+          name: aurora_vfs-${{ env.KMI }}-${{ github.run_id }}
           path: |
             ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/aurora_vfs.ko
-            ${{ github.workspace }}/${{ env.OUTPUT_DIR }}/build.log
+            ${{ github.workspace }}/build.log
           if-no-files-found: error
           retention-days: 30
 
@@ -308,12 +143,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
-          name: aurora_vfs-sm8650-${{ github.run_id }}
+          name: aurora_vfs-${{ needs.build-module.outputs.kmi }}-${{ github.run_id }}
           path: ./release-artifacts
 
       - name: Prepare release assets
@@ -324,37 +157,31 @@ jobs:
             VERSION_TAG="manual-$(date +%Y%m%d-%H%M%S)"
           fi
           cd ./release-artifacts
-          [ -f "aurora_vfs.ko" ] && mv aurora_vfs.ko "aurora_vfs-sm8650-${VERSION_TAG}.ko"
+          [ -f "aurora_vfs.ko" ] && mv aurora_vfs.ko "aurora_vfs-${{ needs.build-module.outputs.kmi }}-${VERSION_TAG}.ko"
           sha256sum *.ko > SHA256SUMS.txt
           echo "VERSION_TAG=${VERSION_TAG}" >> "${GITHUB_ENV}"
 
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.VERSION_TAG }}
-          name: "Aurora VFS SM8650 - ${{ env.VERSION_TAG }}"
+          name: "Aurora VFS ${{ needs.build-module.outputs.kmi }} - ${{ env.VERSION_TAG }}"
           body: |
-            ## OnePlus ACE5 (SM8650) Aurora VFS Kernel Module
+            ## Aurora VFS Kernel Module
 
             ### Build Information
-            - **SoC**: Qualcomm SM8650 (Snapdragon 8 Gen 3)
-            - **Target Kernel**: Android GKI 6.1 (ARM64)
-            - **Kernel Branch**: `${{ needs.build-module.outputs.kernel_branch }}`
-            - **Clang**: `${{ needs.build-module.outputs.clang_version }}`
+            - **Target**: OnePlus ACE5 (SM8650)
+            - **KMI**: `${{ needs.build-module.outputs.kmi }}`
+            - **DDK Release**: `${{ env.DDK_RELEASE }}`
             - **Commit**: ${{ github.sha }}
 
             ### Installation
             ```bash
-            adb push aurora_vfs-sm8650-*.ko /data/local/tmp/
-            adb shell su -c "insmod /data/local/tmp/aurora_vfs-sm8650-*.ko"
+            adb push aurora_vfs-*.ko /data/local/tmp/
+            adb shell su -c "insmod /data/local/tmp/aurora_vfs-*.ko"
             adb shell su -c "cat /sys/kernel/ztrosu/vfs/version"
             ```
-
-            ### Trace Output
-            ```bash
-            adb shell su -c "cat /sys/kernel/tracing/trace | grep aurora_vfs"
-            ```
           files: |
-            ./release-artifacts/aurora_vfs-sm8650-*.ko
+            ./release-artifacts/aurora_vfs-*.ko
             ./release-artifacts/SHA256SUMS.txt
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') }}
