@@ -227,6 +227,10 @@ struct vfs_debug_ctx {
     struct miscdevice   pipe_misc;          /* misc设备 */
 };
 
+/* ==================== 全局上下文 ==================== */
+
+extern struct vfs_debug_ctx g_ctx;
+
 /* ==================== 规则引擎接口 ==================== */
 
 /**
