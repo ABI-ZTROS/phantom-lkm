@@ -884,6 +884,16 @@ static int __init aurora_vfs_init(void)
         return ret;
     }
     
+    /* 初始化 Netlink 事件推送 */
+    ret = vfs_netlink_init();
+    if (ret) {
+        vfs_pipe_exit();
+        vfs_sysfs_exit();
+        mutex_destroy(&g_ctx.rules_mutex);
+        mutex_destroy(&g_ctx.hooks_mutex);
+        return ret;
+    }
+    
     g_ctx.initialized = true;
     
     vfs_trace("module loaded, version=%s", AURORA_VFS_VERSION);
@@ -895,6 +905,9 @@ static void __exit aurora_vfs_exit(void)
     vfs_trace_func();
     
     g_ctx.initialized = false;
+    
+    /* 注销 Netlink 事件推送 */
+    vfs_netlink_exit();
     
     /* 注销 Pipe 通讯 */
     vfs_pipe_exit();

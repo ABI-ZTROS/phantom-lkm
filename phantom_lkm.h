@@ -23,6 +23,9 @@
 #include <linux/miscdevice.h>   /* miscdevice */
 #include <linux/fs.h>           /* file_operations */
 #include <linux/uaccess.h>      /* copy_from_user */
+#include <net/sock.h>           /* netlink socket */
+#include <linux/netlink.h>      /* netlink messages */
+#include <linux/skbuff.h>       /* sk_buff */
 
 /* trace_printk 头文件（某些内核配置中不存在） */
 #if defined(CONFIG_TRACE_PRINTK) || defined(CONFIG_FTRACE)
@@ -71,6 +74,28 @@
 #define AURORA_VFS_NL_FAMILY   NETLINK_USERSOCK
 #define AURORA_VFS_NL_GROUP    31      /* 多播组号 */
 #define VFS_NL_MAX_MSG_LEN     4096    /* 单条事件最大长度 */
+#define VFS_NL_TX_BUF_SIZE     16384   /* 内核发送缓冲区 */
+
+/* Netlink 事件类型 */
+#define EVENT_VFS_OPEN         1    /* 文件打开 */
+#define EVENT_VFS_READ         2    /* 文件读取 */
+#define EVENT_VFS_WRITE        3    /* 文件写入 */
+#define EVENT_VFS_CLOSE        4    /* 文件关闭 */
+#define EVENT_VFS_DENY         5    /* 访问被拒绝 */
+#define EVENT_HOOK_ADDED       10   /* Hook目标已添加 */
+#define EVENT_HOOK_REMOVED     11   /* Hook目标已移除 */
+#define EVENT_RULE_CHANGED     12   /* 规则已变更 */
+
+/* Netlink 事件结构体 (28字节固定头 + 变长path) */
+struct vfs_event {
+    __u32 magic;       /* 0xAF5F */
+    __u32 event_type;  /* 事件类型 */
+    __u32 pid;         /* 触发进程PID */
+    __u32 uid;         /* 触发进程UID */
+    __u32 path_len;    /* 文件路径长度 (不含\0) */
+    __u8  path[];      /* 文件路径 (变长) */
+    /* 后面紧跟: __u64 timestamp, __u32 result */
+};
 
 /* ==================== 枚举定义 ==================== */
 
@@ -345,6 +370,30 @@ void vfs_pipe_exit(void);
  * @return: 成功返回0
  */
 int vfs_pipe_process_command(struct vfs_command *cmd, void *data);
+
+/* ==================== Netlink接口 ==================== */
+
+/**
+ * vfs_netlink_init - 初始化Netlink通讯
+ * @return: 成功返回0
+ */
+int vfs_netlink_init(void);
+
+/**
+ * vfs_netlink_exit - 注销Netlink通讯
+ */
+void vfs_netlink_exit(void);
+
+/**
+ * vfs_netlink_send_event - 发送VFS事件
+ * @event_type: 事件类型 (EVENT_VFS_OPEN 等)
+ * @pid: 触发进程PID
+ * @uid: 触发进程UID
+ * @path: 文件路径
+ * @result: 0=allow, 1=deny
+ */
+void vfs_netlink_send_event(u32 event_type, u32 pid, u32 uid,
+                            const char *path, u32 result);
 
 /* ==================== 调试输出宏 ==================== */
 
