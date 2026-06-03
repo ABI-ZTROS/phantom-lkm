@@ -78,8 +78,9 @@ jobs:
           echo "=== Building aurora_vfs.ko for KMI: ${{ env.KMI }} ==="
 
           # DDK 环境中 CC=clang, 使用内核构建系统
+          # KERNELDIR 环境变量由 DDK 容器设置
           cd $GITHUB_WORKSPACE
-          make CC=clang 2>&1 | tee build.log
+          make CC=clang ARCH=arm64 2>&1 | tee build.log
 
           BUILD_EXIT_CODE=${PIPESTATUS[0]}
 

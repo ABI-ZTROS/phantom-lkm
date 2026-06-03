@@ -12,7 +12,11 @@ obj-m += $(MODULE_NAME).o
 $(MODULE_NAME)-objs := phantom_lkm.o pipe.o netlink.o
 
 # 默认内核源码路径（可通过KDIR参数覆盖）
+# DDK容器中通常通过环境变量 KERNELDIR 或 KDIR 指定
+KDIR ?= $(KERNELDIR)
+ifeq ($(KDIR),)
 KDIR ?= /lib/modules/$(shell uname -r)/build
+endif
 
 # 交叉编译支持（用于Android GKI内核）
 # 使用示例: make CROSS_COMPILE=aarch64-linux-android- ARCH=arm64
