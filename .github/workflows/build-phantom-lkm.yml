@@ -54,11 +54,11 @@ env:
 
 jobs:
   build-module:
-    name: Build aurora_vfs.ko (${{ env.KMI }})
+    name: Build aurora_vfs.ko (android14-6.1)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: ghcr.io/ylarod/ddk-min:${{ env.KMI }}-${{ env.DDK_RELEASE }}
+      image: ghcr.io/ylarod/ddk-min:android14-6.1-20260313
       options: --privileged
 
     outputs:
