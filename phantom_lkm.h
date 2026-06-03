@@ -27,13 +27,10 @@
 #include <linux/netlink.h>      /* netlink messages */
 #include <linux/skbuff.h>       /* sk_buff */
 
-/* trace_printk 头文件（某些内核配置中不存在） */
-#if defined(CONFIG_TRACE_PRINTK) || defined(CONFIG_FTRACE)
-#include <linux/trace_printk.h>
-#else
-/* fallback: 使用 pr_debug 替代 trace_printk */
-#define trace_printk(fmt, ...) pr_debug(fmt, ##__VA_ARGS__)
-#endif
+/* trace_printk 头文件（Android GKI内核中通常不存在）
+ * 直接使用 pr_debug 替代
+ */
+#include <linux/printk.h>
 
 /* ==================== 模块信息 ==================== */
 
@@ -398,15 +395,15 @@ void vfs_netlink_send_event(u32 event_type, u32 pid, u32 uid,
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \
-    trace_printk("[aurora_vfs] " fmt "\n", ##__VA_ARGS__)
+    pr_debug("[aurora_vfs] " fmt "\n", ##__VA_ARGS__)
 
 #define vfs_trace_func() \
-    trace_printk("[aurora_vfs] %s\n", __func__)
+    pr_debug("[aurora_vfs] %s\n", __func__)
 
 #define vfs_trace_level(level, fmt, ...) \
     do { \
         if (g_ctx.policy.log_level >= level) \
-            trace_printk("[aurora_vfs] " fmt "\n", ##__VA_ARGS__); \
+            pr_debug("[aurora_vfs] " fmt "\n", ##__VA_ARGS__); \
     } while (0)
 
 #endif /* _PHANTOM_LKM_H_ */
