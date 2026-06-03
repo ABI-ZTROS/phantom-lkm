@@ -14,11 +14,6 @@ on:
   push:
     branches: [master, main]
     tags: ['v*']
-    paths:
-      - '*.c'
-      - '*.h'
-      - 'Makefile'
-      - '.github/workflows/build-phantom-lkm.yml'
   workflow_dispatch:
     inputs:
       kmi:
