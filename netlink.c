@@ -17,21 +17,23 @@
  *
  * 目前内核模块只推送事件，不处理用户空间发来的 Netlink 消息。
  * 但需要实现此回调以支持安全检查和 CAP_ACK 确认。
+ * 
+ * 注意：内核6.1+中 input 回调返回 void
  */
-static int aurora_vfs_nl_rcv_msg(struct sk_buff *skb)
+static void aurora_vfs_nl_rcv_msg(struct sk_buff *skb)
 {
     struct nlmsghdr *nlh;
     const struct cred *cred;
 
     if (!skb) {
         vfs_trace("netlink: received NULL skb");
-        return -EINVAL;
+        return;
     }
 
     nlh = nlmsg_hdr(skb);
     if (!nlh) {
         vfs_trace("netlink: received NULL nlh");
-        return -EINVAL;
+        return;
     }
 
     /* 安全检查：仅允许 root (UID=0) 连接 */
@@ -39,14 +41,12 @@ static int aurora_vfs_nl_rcv_msg(struct sk_buff *skb)
     if (!uid_eq(cred->uid, GLOBAL_ROOT_UID)) {
         vfs_trace("netlink: rejected message from non-root uid=%u",
                   __kuid_val(cred->uid));
-        return -EPERM;
+        return;
     }
 
     /* 目前不处理用户空间发来的命令，仅确认接收 */
     vfs_trace("netlink: received message from root, type=%u, len=%u",
               nlh->nlmsg_type, nlh->nlmsg_len);
-
-    return 0;
 }
 
 /* ==================== Netlink 配置 ==================== */
@@ -63,8 +63,6 @@ static struct netlink_kernel_cfg nl_cfg = {
  */
 int vfs_netlink_init(void)
 {
-    struct net *net;
-
     /* 使用 init_net 命名空间 */
     g_ctx.nlsk = netlink_kernel_create(&init_net,
                                         AURORA_VFS_NL_FAMILY,
@@ -216,8 +214,10 @@ void vfs_netlink_send_event(u32 event_type, u32 pid, u32 uid,
     result_val = result;
     memcpy(data, &result_val, sizeof(__u32));
 
-    /* 多播发送 */
-    netlink_multicast(g_ctx.nlsk, skb, 0, AURORA_VFS_NL_GROUP, GFP_ATOMIC);
+    /* 多播发送
+     * 内核 6.1+ 使用 nlmsg_multicast 替代 netlink_multicast
+     */
+    nlmsg_multicast(g_ctx.nlsk, skb, 0, AURORA_VFS_NL_GROUP, GFP_ATOMIC);
 
     vfs_trace("netlink: sent event type=%u pid=%u uid=%u path=%s result=%u",
               event_type, pid, uid, path ? path : "(none)", result);
