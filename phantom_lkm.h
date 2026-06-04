@@ -438,6 +438,28 @@ bool partition_is_protected(const char *path);
  */
 bool partition_check_write(const char *path, pid_t pid, uid_t uid);
 
+/* ==================== 防格机接口 ==================== */
+
+struct linux_binprm;
+
+/**
+ * anti_brick_init - 初始化防格机模块
+ * @return: 成功返回0
+ */
+int anti_brick_init(void);
+
+/**
+ * anti_brick_exit - 退出防格机模块
+ */
+void anti_brick_exit(void);
+
+/**
+ * anti_brick_check_exec - 检查 exec 调用是否需要拦截
+ * @bprm: binprm 结构
+ * @return: 0=允许执行, -EPERM=拒绝执行
+ */
+int anti_brick_check_exec(struct linux_binprm *bprm);
+
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \
