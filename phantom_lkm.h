@@ -396,6 +396,48 @@ void vfs_netlink_exit(void);
 void vfs_netlink_send_event(u32 event_type, u32 pid, u32 uid,
                             const char *path, u32 result);
 
+/* ==================== 安全审计接口 ==================== */
+
+/**
+ * security_audit_init - 初始化安全审计模块
+ * @return: 成功返回0
+ */
+int security_audit_init(void);
+
+/**
+ * security_audit_exit - 退出安全审计模块
+ */
+void security_audit_exit(void);
+
+/**
+ * shell_audit_record_exec - 记录Shell执行事件
+ * @caller_pid: 调用者PID
+ * @caller_uid: 调用者UID
+ * @interpreter: 解释器路径
+ * @script_path: 脚本路径（交互式为NULL）
+ * @is_interactive: 是否交互式
+ */
+void shell_audit_record_exec(pid_t caller_pid, uid_t caller_uid,
+                              const char *interpreter,
+                              const char *script_path,
+                              bool is_interactive);
+
+/**
+ * partition_is_protected - 检查路径是否在受保护分区
+ * @path: 文件路径
+ * @return: true=受保护
+ */
+bool partition_is_protected(const char *path);
+
+/**
+ * partition_check_write - 检查对受保护分区的写操作
+ * @path: 目标路径
+ * @pid: 写入进程PID
+ * @uid: 写入进程UID
+ * @return: true=允许, false=拒绝
+ */
+bool partition_check_write(const char *path, pid_t pid, uid_t uid);
+
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \

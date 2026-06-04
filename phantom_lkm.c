@@ -883,6 +883,13 @@ static int __init aurora_vfs_init(void)
         mutex_destroy(&g_ctx.hooks_mutex);
         return ret;
     }
+
+    /* 初始化安全审计模块 */
+    ret = security_audit_init();
+    if (ret) {
+        vfs_trace("WARNING: security audit init failed (%d), continuing", ret);
+        /* 非致命错误，继续运行 */
+    }
     
     /* 初始化 Netlink 事件推送 */
     ret = vfs_netlink_init();
@@ -911,7 +918,10 @@ static void __exit aurora_vfs_exit(void)
     
     /* 注销 Pipe 通讯 */
     vfs_pipe_exit();
-    
+
+    /* 注销安全审计 */
+    security_audit_exit();
+
     /* 注销sysfs */
     vfs_sysfs_exit();
     
