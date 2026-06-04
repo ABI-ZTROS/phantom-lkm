@@ -640,6 +640,13 @@ static ssize_t ab_timeout_store(struct kobject *kobj,
     return count;
 }
 
+/* antibrick/active - 模块是否活跃（只读，用户层检测用） */
+static ssize_t ab_active_show(struct kobject *kobj,
+                               struct kobj_attribute *attr, char *buf)
+{
+    return scnprintf(buf, PAGE_SIZE, "1\n");
+}
+
 /* sysfs 属性 */
 static struct kobj_attribute ab_pending_attr =
     __ATTR(pending, 0444, ab_pending_show, NULL);
@@ -659,6 +666,9 @@ static struct kobj_attribute ab_enabled_attr =
 static struct kobj_attribute ab_timeout_attr =
     __ATTR(timeout, 0644, ab_timeout_show, ab_timeout_store);
 
+static struct kobj_attribute ab_active_attr =
+    __ATTR(active, 0444, ab_active_show, NULL);
+
 static struct attribute *ab_attrs[] = {
     &ab_pending_attr.attr,
     &ab_allow_attr.attr,
@@ -666,6 +676,7 @@ static struct attribute *ab_attrs[] = {
     &ab_stats_attr.attr,
     &ab_enabled_attr.attr,
     &ab_timeout_attr.attr,
+    &ab_active_attr.attr,
     NULL
 };
 
