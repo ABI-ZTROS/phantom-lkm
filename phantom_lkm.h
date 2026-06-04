@@ -460,6 +460,66 @@ void anti_brick_exit(void);
  */
 int anti_brick_check_exec(struct linux_binprm *bprm);
 
+/* ==================== 身份伪装接口 ==================== */
+
+/**
+ * identity_spoof_init - 初始化身份伪装模块
+ * @return: 成功返回0
+ */
+int identity_spoof_init(void);
+
+/**
+ * identity_spoof_exit - 退出身份伪装模块
+ */
+void identity_spoof_exit(void);
+
+/* 伪装策略 */
+#define SPOOF_FIXED         0
+#define SPOOF_RANDOM        1
+#define SPOOF_RANDOM_PER_APP 2
+#define SPOOF_ROTATE        3
+
+/* 身份标识类型 */
+#define SPOOF_MAC_WIFI      0
+#define SPOOF_MAC_BT        1
+#define SPOOF_ANDROID_ID    2
+#define SPOOF_BUILD_SERIAL  3
+#define SPOOF_IMEI          4
+#define SPOOF_IMSI          5
+#define SPOOF_AD_ID         6
+#define SPOOF_GSF_ID        7
+#define SPOOF_WIDEWINE_ID   8
+#define SPOOF_FINGERPRINT   9
+
+/**
+ * spoof_add_rule - 添加伪装规则
+ * @package_name: 目标包名
+ * @type: 标识类型
+ * @strategy: 伪装策略
+ * @fake_value: 固定伪装值（可为NULL）
+ * @rotate_interval_sec: 轮换间隔（秒）
+ * @return: 规则ID，<0=错误
+ */
+int spoof_add_rule(const char *package_name, int type,
+                    int strategy, const char *fake_value,
+                    unsigned int rotate_interval_sec);
+
+/**
+ * spoof_remove_rule - 删除伪装规则
+ * @id: 规则ID
+ * @return: 0=成功
+ */
+int spoof_remove_rule(int id);
+
+/**
+ * spoof_intercept_read - 拦截读取操作
+ * @path: 文件路径
+ * @buf: 输出缓冲区
+ * @len: 缓冲区长度
+ * @return: >0=返回伪装值, 0=不拦截
+ */
+int spoof_intercept_read(const char *path, char *buf, size_t len);
+
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \

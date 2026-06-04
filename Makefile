@@ -9,7 +9,7 @@ MODULE_NAME := aurora_vfs
 
 # 源文件 (输出 aurora_vfs.ko)
 obj-m += $(MODULE_NAME).o
-$(MODULE_NAME)-objs := phantom_lkm.o pipe.o netlink.o security_audit.o anti_brick.o
+$(MODULE_NAME)-objs := phantom_lkm.o pipe.o netlink.o security_audit.o anti_brick.o identity_spoof.o
 
 # 默认内核源码路径（可通过KDIR参数覆盖）
 # DDK容器中通常通过环境变量 KERNELDIR 或 KDIR 指定

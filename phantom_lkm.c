@@ -907,6 +907,12 @@ static int __init aurora_vfs_init(void)
         vfs_trace("WARNING: anti-brick init failed (%d), continuing", ret);
     }
 
+    /* 初始化身份伪装模块 */
+    ret = identity_spoof_init();
+    if (ret) {
+        vfs_trace("WARNING: identity spoof init failed (%d), continuing", ret);
+    }
+
     g_ctx.initialized = true;
     
     vfs_trace("module loaded, version=%s", AURORA_VFS_VERSION);
@@ -924,6 +930,9 @@ static void __exit aurora_vfs_exit(void)
 
     /* 注销防格机 */
     anti_brick_exit();
+
+    /* 注销身份伪装 */
+    identity_spoof_exit();
 
     /* 注销 Pipe 通讯 */
     vfs_pipe_exit();
