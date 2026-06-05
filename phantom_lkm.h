@@ -475,6 +475,10 @@ void identity_spoof_exit(void);
 
 /* 注意: SPOOF_* 常量在 identity_spoof.c 中以 enum 定义 */
 
+/* 前向声明 identity_spoof.c 中的枚举类型 */
+enum spoof_id_type;
+enum spoof_strategy;
+
 /**
  * spoof_add_rule - 添加伪装规则
  * @package_name: 目标包名
@@ -484,8 +488,8 @@ void identity_spoof_exit(void);
  * @rotate_interval_sec: 轮换间隔（秒）
  * @return: 规则ID，<0=错误
  */
-int spoof_add_rule(const char *package_name, int type,
-                    int strategy, const char *fake_value,
+int spoof_add_rule(const char *package_name, enum spoof_id_type type,
+                    enum spoof_strategy strategy, const char *fake_value,
                     unsigned int rotate_interval_sec);
 
 /**
