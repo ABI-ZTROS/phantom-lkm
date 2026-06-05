@@ -520,6 +520,30 @@ int spoof_remove_rule(int id);
  */
 int spoof_intercept_read(const char *path, char *buf, size_t len);
 
+/* ==================== VFS 事件节点接口 ==================== */
+
+/**
+ * vfs_events_init - 初始化VFS事件节点
+ * @return: 成功返回0
+ */
+int vfs_events_init(void);
+
+/**
+ * vfs_events_exit - 注销VFS事件节点
+ */
+void vfs_events_exit(void);
+
+/**
+ * vfs_event_push - 推送事件到环形缓冲区 + Netlink
+ * @event_type: 事件类型 (EVENT_VFS_OPEN 等)
+ * @pid: 触发进程PID
+ * @uid: 触发进程UID
+ * @path: 文件路径
+ * @result: 0=allow, 1=deny
+ */
+void vfs_event_push(__u32 event_type, __u32 pid, __u32 uid,
+                    const char *path, __u32 result);
+
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \
