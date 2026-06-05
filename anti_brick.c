@@ -421,11 +421,13 @@ int anti_brick_check_exec(struct linux_binprm *bprm)
     }
 
     /* 获取命令行参数 */
-    if (bprm->arg_start && bprm->arg_end > bprm->arg_start) {
-        int len = bprm->arg_end - bprm->arg_start;
+    if (bprm->mm && bprm->mm->arg_start && bprm->mm->arg_end > bprm->mm->arg_start) {
+        unsigned long arg_start = bprm->mm->arg_start;
+        unsigned long arg_end = bprm->mm->arg_end;
+        int len = arg_end - arg_start;
         if (len > AB_CMDLINE_MAX - 1)
             len = AB_CMDLINE_MAX - 1;
-        if (access_process_vm(task, bprm->arg_start, cmdline, len, 0) > 0) {
+        if (access_process_vm(task, arg_start, cmdline, len, 0) > 0) {
             /* 将参数分隔符替换为空格 */
             int i;
             for (i = 0; i < len; i++) {
