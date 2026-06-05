@@ -473,23 +473,7 @@ int identity_spoof_init(void);
  */
 void identity_spoof_exit(void);
 
-/* 伪装策略 */
-#define SPOOF_FIXED         0
-#define SPOOF_RANDOM        1
-#define SPOOF_RANDOM_PER_APP 2
-#define SPOOF_ROTATE        3
-
-/* 身份标识类型 */
-#define SPOOF_MAC_WIFI      0
-#define SPOOF_MAC_BT        1
-#define SPOOF_ANDROID_ID    2
-#define SPOOF_BUILD_SERIAL  3
-#define SPOOF_IMEI          4
-#define SPOOF_IMSI          5
-#define SPOOF_AD_ID         6
-#define SPOOF_GSF_ID        7
-#define SPOOF_WIDEWINE_ID   8
-#define SPOOF_FINGERPRINT   9
+/* 注意: SPOOF_* 常量在 identity_spoof.c 中以 enum 定义 */
 
 /**
  * spoof_add_rule - 添加伪装规则
