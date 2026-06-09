@@ -12,6 +12,10 @@
 
 struct vfs_debug_ctx g_ctx;
 
+/* LSM Hook 状态 */
+enum lsm_hook_method g_lsm_method = LSM_HOOK_NONE;
+bool g_lsm_hooks_registered = false;
+
 /* ==================== 统计计数器实现 ==================== */
 
 void vfs_stats_init(void)
@@ -839,6 +843,398 @@ void vfs_sysfs_exit(void)
     vfs_trace("sysfs exited");
 }
 
+/* ==================== LSM Hook 实现 ==================== */
+
+/* 前向声明 */
+static int aurora_security_file_open(struct file *file);
+static int aurora_security_file_permission(struct file *file, int mask);
+static int aurora_security_bprm_check(struct linux_binprm *bprm);
+
+/* 安全Hook列表 (LSM框架) */
+static struct security_hook_list aurora_hooks[] __lsm_ro_after_init = {
+    LSM_HOOK_INIT(file_open, aurora_security_file_open),
+    LSM_HOOK_INIT(file_permission, aurora_security_file_permission),
+    LSM_HOOK_INIT(bprm_check_security, aurora_security_bprm_check),
+};
+
+/* 辅助函数：从 file 结构获取绝对路径 */
+static int aurora_get_path_from_file(struct file *file, char *buf, size_t buflen)
+{
+    struct path *path;
+    char *pathname = NULL;
+
+    if (!file || !buf || buflen == 0)
+        return -EINVAL;
+
+    path = &file->f_path;
+    pathname = d_path(path, buf, buflen);
+    if (IS_ERR(pathname)) {
+        return PTR_ERR(pathname);
+    }
+
+    /* d_path 可能返回 buf 中间位置，需要移动到开头 */
+    if (pathname != buf) {
+        size_t len = strlen(pathname);
+        if (len >= buflen)
+            len = buflen - 1;
+        memmove(buf, pathname, len);
+        buf[len] = '\0';
+    }
+
+    return 0;
+}
+
+/* 辅助函数：判断 mask 是否为写操作 */
+static bool aurora_mask_is_write(int mask)
+{
+    return (mask & (MAY_WRITE | MAY_APPEND)) != 0;
+}
+
+/* 辅助函数：判断 mask 是否为读操作 */
+static bool aurora_mask_is_read(int mask)
+{
+    return (mask & (MAY_READ | MAY_EXEC)) != 0;
+}
+
+/*
+ * aurora_security_file_open - LSM file_open hook
+ * 拦截文件打开操作，连接:
+ *   - vfs_rules_check()   规则检查
+ *   - vfs_hook_check()    Hook目标检查
+ *   - vfs_stats_update()  统计更新
+ *   - spoof_intercept_read() 身份伪装读拦截
+ */
+static int aurora_security_file_open(struct file *file)
+{
+    char path_buf[VFS_MAX_PATH_LEN];
+    enum vfs_action action;
+    struct vfs_hook_target *hook;
+    unsigned int hook_mode = 0;
+    pid_t pid = current->pid;
+    uid_t uid = __kuid_val(current_uid());
+    int ret = 0;
+
+    if (!g_ctx.policy.enabled)
+        return 0;
+
+    /* 获取文件路径 */
+    if (aurora_get_path_from_file(file, path_buf, sizeof(path_buf)) != 0)
+        return 0;
+
+    /* 检查当前进程是否在Hook列表中 */
+    hook = vfs_hook_check(pid, uid, &hook_mode);
+
+    /* 规则引擎检查 */
+    action = vfs_rules_check(path_buf, VFS_OP_READ | VFS_OP_WRITE);
+
+    if (action == VFS_ACTION_DENY) {
+        vfs_stats_update(4); /* denied */
+        vfs_netlink_send_event(EVENT_VFS_DENY, pid, uid, path_buf, 1);
+        vfs_trace_level(1, "LSM DENY open: %s pid=%d uid=%d", path_buf, pid, uid);
+        return -EPERM;
+    }
+
+    /* 身份伪装拦截 (读操作) */
+    if (hook && (hook_mode & VFS_HOOK_INTERCEPT_READ)) {
+        char spoof_buf[256];
+        int spoof_len = spoof_intercept_read(path_buf, spoof_buf, sizeof(spoof_buf));
+        if (spoof_len > 0) {
+            vfs_trace_level(2, "LSM SPOOF read: %s pid=%d", path_buf, pid);
+            /* 注意：这里仅记录，实际spoof在read路径处理 */
+        }
+    }
+
+    /* 更新统计 */
+    vfs_stats_update(0); /* open */
+    vfs_netlink_send_event(EVENT_VFS_OPEN, pid, uid, path_buf, 0);
+
+    vfs_trace_level(4, "LSM ALLOW open: %s pid=%d uid=%d", path_buf, pid, uid);
+    return 0;
+}
+
+/*
+ * aurora_security_file_permission - LSM file_permission hook
+ * 拦截文件读写权限检查，连接:
+ *   - vfs_rules_check()       规则检查
+ *   - vfs_hook_check()        Hook目标检查
+ *   - vfs_stats_update()      统计更新
+ *   - partition_check_write() 受保护分区写检查
+ */
+static int aurora_security_file_permission(struct file *file, int mask)
+{
+    char path_buf[VFS_MAX_PATH_LEN];
+    enum vfs_action action;
+    struct vfs_hook_target *hook;
+    unsigned int hook_mode = 0;
+    pid_t pid = current->pid;
+    uid_t uid = __kuid_val(current_uid());
+    unsigned int mode_mask = 0;
+
+    if (!g_ctx.policy.enabled)
+        return 0;
+
+    /* 获取文件路径 */
+    if (aurora_get_path_from_file(file, path_buf, sizeof(path_buf)) != 0)
+        return 0;
+
+    /* 判断操作类型 */
+    if (aurora_mask_is_read(mask))
+        mode_mask |= VFS_OP_READ;
+    if (aurora_mask_is_write(mask))
+        mode_mask |= VFS_OP_WRITE;
+
+    if (mode_mask == 0)
+        return 0;
+
+    /* 检查当前进程是否在Hook列表中 */
+    hook = vfs_hook_check(pid, uid, &hook_mode);
+
+    /* 规则引擎检查 */
+    action = vfs_rules_check(path_buf, mode_mask);
+    if (action == VFS_ACTION_DENY) {
+        vfs_stats_update(4); /* denied */
+        vfs_netlink_send_event(EVENT_VFS_DENY, pid, uid, path_buf, 1);
+        vfs_trace_level(1, "LSM DENY %s: %s pid=%d uid=%d",
+                        (mode_mask & VFS_OP_WRITE) ? "write" : "read",
+                        path_buf, pid, uid);
+        return -EPERM;
+    }
+
+    /* 受保护分区写检查 */
+    if ((mode_mask & VFS_OP_WRITE) && !partition_check_write(path_buf, pid, uid)) {
+        vfs_stats_update(4); /* denied */
+        vfs_netlink_send_event(EVENT_VFS_DENY, pid, uid, path_buf, 1);
+        vfs_trace_level(1, "LSM PARTITION DENY write: %s pid=%d uid=%d", path_buf, pid, uid);
+        return -EPERM;
+    }
+
+    /* 更新统计 */
+    if (mode_mask & VFS_OP_READ) {
+        vfs_stats_update(1); /* read */
+        vfs_netlink_send_event(EVENT_VFS_READ, pid, uid, path_buf, 0);
+    }
+    if (mode_mask & VFS_OP_WRITE) {
+        vfs_stats_update(2); /* write */
+        vfs_netlink_send_event(EVENT_VFS_WRITE, pid, uid, path_buf, 0);
+    }
+
+    vfs_trace_level(4, "LSM ALLOW %s: %s pid=%d uid=%d",
+                    (mode_mask & VFS_OP_WRITE) ? "write" : "read",
+                    path_buf, pid, uid);
+    return 0;
+}
+
+/*
+ * aurora_security_bprm_check - LSM bprm_check_security hook
+ * 拦截 execve 执行，连接:
+ *   - anti_brick_check_exec()    防格机检查
+ *   - shell_audit_record_exec()  Shell执行审计
+ */
+static int aurora_security_bprm_check(struct linux_binprm *bprm)
+{
+    pid_t pid = current->pid;
+    uid_t uid = __kuid_val(current_uid());
+    int ret;
+    const char *interp = NULL;
+
+    if (!g_ctx.policy.enabled)
+        return 0;
+
+    /* 防格机检查 */
+    ret = anti_brick_check_exec(bprm);
+    if (ret != 0) {
+        vfs_trace_level(1, "LSM ANTI_BRICK DENY exec pid=%d uid=%d", pid, uid);
+        return ret;
+    }
+
+    /* Shell 执行审计 */
+    if (bprm->file && bprm->file->f_path.dentry) {
+        interp = bprm->file->f_path.dentry->d_name.name;
+    }
+
+    if (interp) {
+        bool is_shell = (strstr(interp, "sh") != NULL ||
+                         strstr(interp, "bash") != NULL ||
+                         strstr(interp, "mksh") != NULL ||
+                         strstr(interp, "zsh") != NULL ||
+                         strstr(interp, "dash") != NULL);
+        if (is_shell) {
+            shell_audit_record_exec(pid, uid, interp, NULL, true);
+            vfs_trace_level(2, "LSM SHELL AUDIT: %s pid=%d uid=%d", interp, pid, uid);
+        }
+    }
+
+    vfs_trace_level(4, "LSM ALLOW exec pid=%d uid=%d", pid, uid);
+    return 0;
+}
+
+/* ==================== kprobe 回退实现 ==================== */
+
+#ifdef CONFIG_KPROBES
+
+/* kprobe 用于 security_file_open */
+static int kp_file_open_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    struct file *file;
+
+#if defined(CONFIG_X86_64)
+    file = (struct file *)regs->di;
+#elif defined(CONFIG_ARM64)
+    file = (struct file *)regs->regs[0];
+#else
+    return 0;
+#endif
+
+    return aurora_security_file_open(file);
+}
+
+/* kprobe 用于 security_file_permission */
+static int kp_file_perm_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    struct file *file;
+    int mask;
+
+#if defined(CONFIG_X86_64)
+    file = (struct file *)regs->di;
+    mask = (int)regs->si;
+#elif defined(CONFIG_ARM64)
+    file = (struct file *)regs->regs[0];
+    mask = (int)regs->regs[1];
+#else
+    return 0;
+#endif
+
+    return aurora_security_file_permission(file, mask);
+}
+
+/* kprobe 用于 security_bprm_check */
+static int kp_bprm_check_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    struct linux_binprm *bprm;
+
+#if defined(CONFIG_X86_64)
+    bprm = (struct linux_binprm *)regs->di;
+#elif defined(CONFIG_ARM64)
+    bprm = (struct linux_binprm *)regs->regs[0];
+#else
+    return 0;
+#endif
+
+    return aurora_security_bprm_check(bprm);
+}
+
+static struct kprobe kp_file_open = {
+    .symbol_name = "security_file_open",
+    .pre_handler = kp_file_open_pre,
+};
+
+static struct kprobe kp_file_perm = {
+    .symbol_name = "security_file_permission",
+    .pre_handler = kp_file_perm_pre,
+};
+
+static struct kprobe kp_bprm_check = {
+    .symbol_name = "security_bprm_check",
+    .pre_handler = kp_bprm_check_pre,
+};
+
+#endif /* CONFIG_KPROBES */
+
+/*
+ * aurora_lsm_hooks_init - 注册 LSM hooks
+ * 优先尝试原生 LSM 框架，失败则回退到 kprobe
+ */
+int aurora_lsm_hooks_init(void)
+{
+    int ret = 0;
+
+    vfs_trace("LSM hooks init: trying native LSM...");
+
+    /* 尝试原生 LSM 注册 */
+#if defined(CONFIG_SECURITY) && defined(security_add_hooks)
+    {
+        /* 内核 6.1+ 使用 security_add_hooks */
+        security_add_hooks(aurora_hooks, ARRAY_SIZE(aurora_hooks), "aurora");
+        g_lsm_method = LSM_HOOK_NATIVE;
+        g_lsm_hooks_registered = true;
+        vfs_trace("LSM hooks registered via native security_add_hooks");
+        return 0;
+    }
+#else
+    vfs_trace("Native LSM not available, falling back to kprobe");
+#endif
+
+    /* 回退到 kprobe */
+#ifdef CONFIG_KPROBES
+    g_lsm_method = LSM_HOOK_KPROBE;
+
+    ret = register_kprobe(&kp_file_open);
+    if (ret < 0) {
+        vfs_trace("kprobe register failed for file_open: %d", ret);
+        g_lsm_method = LSM_HOOK_NONE;
+        return ret;
+    }
+
+    ret = register_kprobe(&kp_file_perm);
+    if (ret < 0) {
+        vfs_trace("kprobe register failed for file_permission: %d", ret);
+        unregister_kprobe(&kp_file_open);
+        g_lsm_method = LSM_HOOK_NONE;
+        return ret;
+    }
+
+    ret = register_kprobe(&kp_bprm_check);
+    if (ret < 0) {
+        vfs_trace("kprobe register failed for bprm_check: %d", ret);
+        unregister_kprobe(&kp_file_perm);
+        unregister_kprobe(&kp_file_open);
+        g_lsm_method = LSM_HOOK_NONE;
+        return ret;
+    }
+
+    g_lsm_hooks_registered = true;
+    vfs_trace("LSM hooks registered via kprobe fallback");
+    return 0;
+#else
+    vfs_trace("ERROR: Neither LSM nor kprobe available, hooks not registered!");
+    g_lsm_method = LSM_HOOK_NONE;
+    return -ENODEV;
+#endif
+}
+
+/*
+ * aurora_lsm_hooks_exit - 注销 LSM hooks
+ */
+void aurora_lsm_hooks_exit(void)
+{
+    if (!g_lsm_hooks_registered)
+        return;
+
+    switch (g_lsm_method) {
+    case LSM_HOOK_NATIVE:
+        /* 原生 LSM 目前内核没有 unregister API，
+         * 但模块卸载时会自动清理
+         */
+        vfs_trace("LSM native hooks: module unload will clean up");
+        break;
+
+    case LSM_HOOK_KPROBE:
+#ifdef CONFIG_KPROBES
+        unregister_kprobe(&kp_file_open);
+        unregister_kprobe(&kp_file_perm);
+        unregister_kprobe(&kp_bprm_check);
+        vfs_trace("LSM kprobe hooks unregistered");
+#endif
+        break;
+
+    default:
+        break;
+    }
+
+    g_lsm_hooks_registered = false;
+    g_lsm_method = LSM_HOOK_NONE;
+}
+
 /* ==================== 模块生命周期 ==================== */
 
 static int __init aurora_vfs_init(void)
@@ -919,18 +1315,28 @@ static int __init aurora_vfs_init(void)
         vfs_trace("WARNING: events init failed (%d), continuing", ret);
     }
 
+    /* 注册 LSM Hooks (必须在其他模块初始化之后) */
+    ret = aurora_lsm_hooks_init();
+    if (ret) {
+        vfs_trace("ERROR: LSM hooks registration failed (%d)", ret);
+        /* LSM 注册失败不阻止模块加载，但记录错误 */
+    }
+
     g_ctx.initialized = true;
-    
-    vfs_trace("module loaded, version=%s", AURORA_VFS_VERSION);
+
+    vfs_trace("module loaded, version=%s, lsm_method=%d", AURORA_VFS_VERSION, g_lsm_method);
     return 0;
 }
 
 static void __exit aurora_vfs_exit(void)
 {
     vfs_trace_func();
-    
+
     g_ctx.initialized = false;
-    
+
+    /* 先注销 LSM Hooks (停止拦截) */
+    aurora_lsm_hooks_exit();
+
     /* 注销 Netlink 事件推送 */
     vfs_netlink_exit();
 
@@ -951,17 +1357,17 @@ static void __exit aurora_vfs_exit(void)
 
     /* 注销sysfs */
     vfs_sysfs_exit();
-    
+
     /* 清理规则 */
     vfs_rules_clear();
-    
+
     /* 清理Hook */
     vfs_hooks_clear();
-    
+
     /* 销毁锁 */
     mutex_destroy(&g_ctx.rules_mutex);
     mutex_destroy(&g_ctx.hooks_mutex);
-    
+
     vfs_trace("module unloaded");
 }
 

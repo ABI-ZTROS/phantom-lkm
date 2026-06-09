@@ -27,6 +27,17 @@
 #include <linux/netlink.h>      /* netlink messages */
 #include <linux/skbuff.h>       /* sk_buff */
 
+/* LSM / Security 头文件 */
+#include <linux/security.h>
+#include <linux/cred.h>
+#include <linux/binfmts.h>
+#include <linux/dcache.h>
+#include <linux/namei.h>
+
+/* kprobe 回退支持 */
+#include <linux/kprobes.h>
+#include <linux/kallsyms.h>
+
 /* trace_printk 头文件（Android GKI内核中通常不存在）
  * 直接使用 pr_debug 替代
  */
@@ -226,6 +237,17 @@ struct vfs_debug_ctx {
     /* v3 新增 - Pipe (阶段2实现) */
     struct miscdevice   pipe_misc;          /* misc设备 */
 };
+
+/* ==================== LSM Hook 状态 ==================== */
+
+enum lsm_hook_method {
+    LSM_HOOK_NONE = 0,
+    LSM_HOOK_NATIVE = 1,   /* 原生 security_add_hooks */
+    LSM_HOOK_KPROBE = 2,   /* kprobe 动态挂钩 */
+};
+
+extern enum lsm_hook_method g_lsm_method;
+extern bool g_lsm_hooks_registered;
 
 /* ==================== 全局上下文 ==================== */
 
@@ -459,6 +481,19 @@ void anti_brick_exit(void);
  * @return: 0=允许执行, -EPERM=拒绝执行
  */
 int anti_brick_check_exec(struct linux_binprm *bprm);
+
+/* ==================== LSM Hook 接口 ==================== */
+
+/**
+ * aurora_lsm_hooks_init - 注册 LSM hooks
+ * @return: 成功返回0
+ */
+int aurora_lsm_hooks_init(void);
+
+/**
+ * aurora_lsm_hooks_exit - 注销 LSM hooks
+ */
+void aurora_lsm_hooks_exit(void);
 
 /* ==================== 身份伪装接口 ==================== */
 
