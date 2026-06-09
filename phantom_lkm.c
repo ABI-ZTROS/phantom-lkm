@@ -1290,11 +1290,8 @@ static int __init aurora_vfs_init(void)
     /* 初始化 Netlink 事件推送 */
     ret = vfs_netlink_init();
     if (ret) {
-        vfs_pipe_exit();
-        vfs_sysfs_exit();
-        mutex_destroy(&g_ctx.rules_mutex);
-        mutex_destroy(&g_ctx.hooks_mutex);
-        return ret;
+        vfs_trace("WARNING: netlink init failed (%d), continuing without event push", ret);
+        /* 非致命错误，netlink仅用于事件推送通知，模块仍可正常工作 */
     }
 
     /* 初始化防格机模块 */
@@ -1325,6 +1322,7 @@ static int __init aurora_vfs_init(void)
     g_ctx.initialized = true;
 
     vfs_trace("module loaded, version=%s, lsm_method=%d", AURORA_VFS_VERSION, g_lsm_method);
+    pr_info("[aurora_vfs] *** MODULE LOADED SUCCESSFULLY (version %s) ***\n", AURORA_VFS_VERSION);
     return 0;
 }
 

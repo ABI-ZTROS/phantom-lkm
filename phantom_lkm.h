@@ -570,15 +570,15 @@ void vfs_event_push(__u32 event_type, __u32 pid, __u32 uid,
 /* ==================== 调试输出宏 ==================== */
 
 #define vfs_trace(fmt, ...) \
-    pr_debug("[aurora_vfs] " fmt "\n", ##__VA_ARGS__)
+    pr_info("[aurora_vfs] " fmt "\n", ##__VA_ARGS__)
 
 #define vfs_trace_func() \
-    pr_debug("[aurora_vfs] %s\n", __func__)
+    pr_info("[aurora_vfs] %s\n", __func__)
 
 #define vfs_trace_level(level, fmt, ...) \
     do { \
         if (g_ctx.policy.log_level >= level) \
-            pr_debug("[aurora_vfs] " fmt "\n", ##__VA_ARGS__); \
+            pr_info("[aurora_vfs] " fmt "\n", ##__VA_ARGS__); \
     } while (0)
 
 #endif /* _PHANTOM_LKM_H_ */
