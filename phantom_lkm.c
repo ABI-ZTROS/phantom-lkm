@@ -61,7 +61,7 @@ void vfs_stats_update(int op_type)
 static int safe_atoi(const char *str)
 {
     int result = 0;
-    kstrtoint(str, 10, &result);
+    (void)kstrtoint(str, 10, &result);
     return result;
 }
 
@@ -135,7 +135,6 @@ struct vfs_rule *vfs_rule_parse(const char *rule_str)
 {
     struct vfs_rule *rule;
     char *buf, *action_str, *path_str, *mode_str;
-    int ret;
     
     if (!rule_str || strlen(rule_str) > VFS_MAX_RULE_LEN)
         return NULL;
@@ -850,12 +849,21 @@ static int aurora_security_file_open(struct file *file);
 static int aurora_security_file_permission(struct file *file, int mask);
 static int aurora_security_bprm_check(struct linux_binprm *bprm);
 
-/* 安全Hook列表 (LSM框架) */
+/*
+ * 原生 LSM Hook 列表
+ * 仅在内核完整导出 struct security_hook_list 时可用
+ * GKI 内核通常不导出此结构体，因此使用 kprobe 回退
+ */
+#if defined(CONFIG_SECURITY) && defined(LSM_HOOK_INIT)
 static struct security_hook_list aurora_hooks[] __lsm_ro_after_init = {
     LSM_HOOK_INIT(file_open, aurora_security_file_open),
     LSM_HOOK_INIT(file_permission, aurora_security_file_permission),
     LSM_HOOK_INIT(bprm_check_security, aurora_security_bprm_check),
 };
+#define AURORA_LSM_NATIVE_AVAILABLE 1
+#else
+#define AURORA_LSM_NATIVE_AVAILABLE 0
+#endif
 
 /* 辅助函数：从 file 结构获取绝对路径 */
 static int aurora_get_path_from_file(struct file *file, char *buf, size_t buflen)
@@ -912,7 +920,6 @@ static int aurora_security_file_open(struct file *file)
     unsigned int hook_mode = 0;
     pid_t pid = current->pid;
     uid_t uid = __kuid_val(current_uid());
-    int ret = 0;
 
     if (!g_ctx.policy.enabled)
         return 0;
@@ -964,8 +971,6 @@ static int aurora_security_file_permission(struct file *file, int mask)
 {
     char path_buf[VFS_MAX_PATH_LEN];
     enum vfs_action action;
-    struct vfs_hook_target *hook;
-    unsigned int hook_mode = 0;
     pid_t pid = current->pid;
     uid_t uid = __kuid_val(current_uid());
     unsigned int mode_mask = 0;
@@ -1150,18 +1155,16 @@ int aurora_lsm_hooks_init(void)
 
     vfs_trace("LSM hooks init: trying native LSM...");
 
-    /* 尝试原生 LSM 注册 */
-#if defined(CONFIG_SECURITY) && defined(security_add_hooks)
-    {
-        /* 内核 6.1+ 使用 security_add_hooks */
-        security_add_hooks(aurora_hooks, ARRAY_SIZE(aurora_hooks), "aurora");
-        g_lsm_method = LSM_HOOK_NATIVE;
-        g_lsm_hooks_registered = true;
-        vfs_trace("LSM hooks registered via native security_add_hooks");
-        return 0;
-    }
+    /* 尝试原生 LSM 注册 (仅当结构体完整导出时) */
+#if AURORA_LSM_NATIVE_AVAILABLE
+    vfs_trace("Native LSM available, registering hooks...");
+    security_add_hooks(aurora_hooks, ARRAY_SIZE(aurora_hooks), "aurora");
+    g_lsm_method = LSM_HOOK_NATIVE;
+    g_lsm_hooks_registered = true;
+    vfs_trace("LSM hooks registered via native security_add_hooks");
+    return 0;
 #else
-    vfs_trace("Native LSM not available, falling back to kprobe");
+    vfs_trace("Native LSM not available (GKI), falling back to kprobe");
 #endif
 
     /* 回退到 kprobe */
