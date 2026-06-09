@@ -991,9 +991,6 @@ static int aurora_security_file_permission(struct file *file, int mask)
     if (mode_mask == 0)
         return 0;
 
-    /* 检查当前进程是否在Hook列表中 */
-    hook = vfs_hook_check(pid, uid, &hook_mode);
-
     /* 规则引擎检查 */
     action = vfs_rules_check(path_buf, mode_mask);
     if (action == VFS_ACTION_DENY) {
