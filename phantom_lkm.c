@@ -1280,6 +1280,16 @@ static int __init aurora_vfs_init(void)
         return ret;
     }
 
+    /* 初始化 ioctl 通讯 (PRIMARY) */
+    ret = vfs_ioctl_init();
+    if (ret) {
+        vfs_pipe_exit();
+        vfs_sysfs_exit();
+        mutex_destroy(&g_ctx.rules_mutex);
+        mutex_destroy(&g_ctx.hooks_mutex);
+        return ret;
+    }
+
     /* 初始化安全审计模块 */
     ret = security_audit_init();
     if (ret) {
@@ -1346,6 +1356,9 @@ static void __exit aurora_vfs_exit(void)
 
     /* 注销 VFS 事件节点 */
     vfs_events_exit();
+
+    /* 注销 ioctl 通讯 */
+    vfs_ioctl_exit();
 
     /* 注销 Pipe 通讯 */
     vfs_pipe_exit();

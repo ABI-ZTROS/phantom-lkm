@@ -84,6 +84,112 @@
 #define VFS_NL_MAX_MSG_LEN     4096    /* 单条事件最大长度 */
 #define VFS_NL_TX_BUF_SIZE     16384   /* 内核发送缓冲区 */
 
+/* v3 新增 - ioctl 通讯 */
+#define AURORA_VFS_IOC_MAGIC   0xAF    /* ioctl Magic Number */
+#define AURORA_VFS_IOCTL_NAME  "aurora_vfs_ioctl"
+
+/* ioctl 命令定义 (使用 _IOR/_IOW/_IOWR 宏) */
+#define AURORA_VFS_GET_VERSION   _IOR(AURORA_VFS_IOC_MAGIC, 0,  struct aurora_ioc_version)
+#define AURORA_VFS_GET_STATS     _IOR(AURORA_VFS_IOC_MAGIC, 1,  struct aurora_ioc_stats)
+#define AURORA_VFS_GET_POLICY    _IOR(AURORA_VFS_IOC_MAGIC, 2,  struct aurora_ioc_policy)
+#define AURORA_VFS_SET_POLICY    _IOW(AURORA_VFS_IOC_MAGIC, 3,  struct aurora_ioc_policy)
+#define AURORA_VFS_GET_RULES     _IOR(AURORA_VFS_IOC_MAGIC, 4,  struct aurora_ioc_rules)
+#define AURORA_VFS_SET_RULES     _IOW(AURORA_VFS_IOC_MAGIC, 5,  struct aurora_ioc_rules)
+#define AURORA_VFS_CLEAR_RULES   _IO(AURORA_VFS_IOC_MAGIC, 6)
+#define AURORA_VFS_GET_HOOKS     _IOR(AURORA_VFS_IOC_MAGIC, 7,  struct aurora_ioc_hooks)
+#define AURORA_VFS_ADD_HOOK      _IOW(AURORA_VFS_IOC_MAGIC, 8,  struct aurora_ioc_hook)
+#define AURORA_VFS_REMOVE_HOOK   _IOW(AURORA_VFS_IOC_MAGIC, 9,  struct aurora_ioc_hook)
+#define AURORA_VFS_RESET_STATS   _IO(AURORA_VFS_IOC_MAGIC, 10)
+#define AURORA_VFS_GET_EVENTS    _IOR(AURORA_VFS_IOC_MAGIC, 11, struct aurora_ioc_events)
+
+/* ioctl 最大命令号 (用于验证) */
+#define AURORA_VFS_IOC_MAXNR     11
+
+/* ==================== ioctl 数据结构 ==================== */
+
+/* 版本信息 */
+struct aurora_ioc_version {
+    __u32 version;       /* 协议版本 */
+    __u32 reserved;
+    char  name[32];      /* 模块名称 */
+};
+
+/* 统计信息 (与 struct vfs_stats 对齐) */
+struct aurora_ioc_stats {
+    __u64 open_count;
+    __u64 read_count;
+    __u64 write_count;
+    __u64 close_count;
+    __u64 denied_count;
+    __u64 last_updated;
+};
+
+/* 策略信息 (与 struct vfs_policy 对齐) */
+struct aurora_ioc_policy {
+    __u8  enabled;        /* 全局开关 */
+    __u8  log_level;      /* 日志级别 0-5 */
+    __u8  default_action; /* 0=allow, 1=deny */
+    __u8  reserved;
+};
+
+/* 单条规则 */
+struct aurora_ioc_rule {
+    __u32 priority;
+    __u8  action;         /* 0=allow, 1=deny */
+    __u8  mode_mask;      /* bit0=read, bit1=write */
+    __u16 reserved;
+    char  path_pattern[VFS_MAX_PATH_LEN];
+};
+
+/* 规则批量操作 */
+struct aurora_ioc_rules {
+    __u32 count;
+    __u32 max_count;      /* 用户空间缓冲区可容纳的最大规则数 */
+    struct aurora_ioc_rule rules[];  /* 变长数组 */
+};
+
+/* 单条 Hook */
+struct aurora_ioc_hook {
+    __u8  type;           /* 0=PID, 1=PACKAGE */
+    __u8  mode;           /* Hook模式 */
+    __u16 reserved;
+    __u32 uid;
+    union {
+        __u32 pid;
+        char  package_name[VFS_MAX_PKG_LEN];
+    };
+    __u8  enabled;
+    __u8  pad[3];
+};
+
+/* Hook 批量读取 */
+struct aurora_ioc_hooks {
+    __u32 count;
+    __u32 max_count;
+    struct aurora_ioc_hook hooks[];
+};
+
+/* 单条事件记录 */
+struct aurora_ioc_event {
+    __u32 magic;
+    __u32 event_type;
+    __u32 pid;
+    __u32 uid;
+    __u32 path_len;
+    __u32 reserved;
+    __u64 timestamp;
+    __u32 result;
+    __u32 pad;
+    char  path[VFS_MAX_PATH_LEN];
+};
+
+/* 事件批量读取 */
+struct aurora_ioc_events {
+    __u32 count;
+    __u32 max_count;
+    struct aurora_ioc_event events[];
+};
+
 /* Netlink 事件类型 */
 #define EVENT_VFS_OPEN         1    /* 文件打开 */
 #define EVENT_VFS_READ         2    /* 文件读取 */
@@ -393,6 +499,19 @@ void vfs_pipe_exit(void);
  * @return: 成功返回0
  */
 int vfs_pipe_process_command(struct vfs_command *cmd, void *data);
+
+/* ==================== ioctl 接口 ==================== */
+
+/**
+ * vfs_ioctl_init - 初始化 ioctl 通讯 (misc 设备)
+ * @return: 成功返回0
+ */
+int vfs_ioctl_init(void);
+
+/**
+ * vfs_ioctl_exit - 注销 ioctl 通讯
+ */
+void vfs_ioctl_exit(void);
 
 /* ==================== Netlink接口 ==================== */
 
