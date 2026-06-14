@@ -184,8 +184,8 @@ struct vfs_rule *vfs_rule_parse(const char *rule_str)
         kfree(rule);
         return NULL;
     }
-    strncpy(rule->path_pattern, path_str, VFS_MAX_PATH_LEN - 1);
-    
+    strscpy(rule->path_pattern, path_str, sizeof(rule->path_pattern));
+
     /* 解析mode */
     rule->mode_mask = 0;
     if (strchr(mode_str, 'r') || strchr(mode_str, 'R'))
@@ -365,9 +365,9 @@ int vfs_hook_add(enum vfs_hook_type type, const char *identifier,
     if (type == VFS_HOOK_PID) {
         hook->pid = safe_atoi(identifier);
     } else {
-        strncpy(hook->package_name, identifier, VFS_MAX_PKG_LEN - 1);
+        strscpy(hook->package_name, identifier, sizeof(hook->package_name));
     }
-    
+
     INIT_LIST_HEAD(&hook->list);
     list_add_tail(&hook->list, &g_ctx.hooks);
     g_ctx.hooks_count++;
@@ -479,7 +479,7 @@ static ssize_t stats_reset_store(struct kobject *kobj, struct kobj_attribute *at
 static ssize_t enabled_show(struct kobject *kobj, struct kobj_attribute *attr,
                             char *buf)
 {
-    return sprintf(buf, "%d\n", g_ctx.policy.enabled ? 1 : 0);
+    return scnprintf(buf, PAGE_SIZE, "%d\n", g_ctx.policy.enabled ? 1 : 0);
 }
 
 static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
@@ -553,8 +553,10 @@ static ssize_t rules_show(struct kobject *kobj, struct kobj_attribute *attr,
     list_for_each_entry(rule, &g_ctx.rules, list) {
         if (rule->enabled) {
             char mode_str[4] = "";
-            if (rule->mode_mask & VFS_OP_READ) strcat(mode_str, "r");
-            if (rule->mode_mask & VFS_OP_WRITE) strcat(mode_str, "w");
+            int mode_pos = 0;
+            if (rule->mode_mask & VFS_OP_READ) mode_str[mode_pos++] = 'r';
+            if (rule->mode_mask & VFS_OP_WRITE) mode_str[mode_pos++] = 'w';
+            mode_str[mode_pos] = '\0';
             
             len += sprintf(buf + len, "%s:%s:%s\n",
                           rule->action == VFS_ACTION_ALLOW ? "allow" : "deny",
@@ -624,10 +626,13 @@ static ssize_t hook_targets_show(struct kobject *kobj, struct kobj_attribute *at
     
     list_for_each_entry(hook, &g_ctx.hooks, list) {
         const char *type_str = hook->type == VFS_HOOK_PID ? "PID" : "PACKAGE";
-        const char *id_str = hook->type == VFS_HOOK_PID ? 
+        const char *id_str = hook->type == VFS_HOOK_PID ?
             kasprintf(GFP_KERNEL, "%d", hook->pid) : hook->package_name;
         const char *mode_str;
-        
+
+        if (hook->type == VFS_HOOK_PID && !id_str)
+            continue;
+
         switch (hook->mode) {
         case VFS_HOOK_MONITOR_ONLY: mode_str = "MONITOR_ONLY"; break;
         case VFS_HOOK_INTERCEPT_READ: mode_str = "INTERCEPT_READ"; break;
@@ -635,13 +640,13 @@ static ssize_t hook_targets_show(struct kobject *kobj, struct kobj_attribute *at
         case VFS_HOOK_INTERCEPT_ALL: mode_str = "INTERCEPT_ALL"; break;
         default: mode_str = "UNKNOWN"; break;
         }
-        
-        len += sprintf(buf + len, "%s:%s:%u:%s:%d\n",
+
+        len += scnprintf(buf + len, PAGE_SIZE - len, "%s:%s:%u:%s:%d\n",
                       type_str, id_str, hook->uid, mode_str, hook->enabled ? 1 : 0);
-        
+
         if (hook->type == VFS_HOOK_PID)
             kfree(id_str);
-        
+
         if (len >= PAGE_SIZE - 100)
             break;
     }
@@ -726,7 +731,10 @@ static ssize_t hook_list_show(struct kobject *kobj, struct kobj_attribute *attr,
         const char *id_str = hook->type == VFS_HOOK_PID ?
             kasprintf(GFP_KERNEL, "%d", hook->pid) : hook->package_name;
         const char *mode_str;
-        
+
+        if (hook->type == VFS_HOOK_PID && !id_str)
+            continue;
+
         switch (hook->mode) {
         case VFS_HOOK_MONITOR_ONLY: mode_str = "MONITOR_ONLY"; break;
         case VFS_HOOK_INTERCEPT_READ: mode_str = "INTERCEPT_READ"; break;
@@ -734,14 +742,14 @@ static ssize_t hook_list_show(struct kobject *kobj, struct kobj_attribute *attr,
         case VFS_HOOK_INTERCEPT_ALL: mode_str = "INTERCEPT_ALL"; break;
         default: mode_str = "UNKNOWN"; break;
         }
-        
-        len += sprintf(buf + len, "%s:%s:%u:%s:%d\n",
+
+        len += scnprintf(buf + len, PAGE_SIZE - len, "%s:%s:%u:%s:%d\n",
                       type_str, id_str, hook->uid, mode_str,
                       hook->enabled ? 1 : 0);
-        
+
         if (hook->type == VFS_HOOK_PID)
             kfree(id_str);
-        
+
         if (len >= PAGE_SIZE - 100)
             break;
     }
