@@ -38,6 +38,14 @@ enum ab_risk_type {
     AB_RISK_FLASH,              /* flash 刷写 */
     AB_RISK_FASTBOOT,           /* fastboot 命令 */
     AB_RISK_RECOVERY,           /* 恢复出厂设置 */
+    /* ColorOS / 一加特有高危操作 */
+    AB_RISK_FORMAT_DATA,        /* format userdata */
+    AB_RISK_ERASE_ALL,          /* erase all / 全盘擦除 */
+    AB_RISK_OTA_DESTROY,        /* 破坏 OTA 分区 */
+    AB_RISK_BOOTLOADER_LOCK,    /* 锁定 bootloader */
+    AB_RISK_COLOROS_RESET,      /* ColorOS 恢复出厂 */
+    AB_RISK_E2FSCK_BAD,         /* 破坏性 fsck */
+    AB_RISK_UFS_PURGE,          /* UFS purge / secure erase */
 };
 
 /* 挂起进程状态 */
@@ -158,6 +166,62 @@ static enum ab_risk_type ab_detect_risk(const char *cmdline, const char *exe)
         return AB_RISK_RECOVERY;
     }
 
+    /* --- ColorOS / 一加特有高危操作检测 --- */
+
+    /* format userdata / 全盘格式化 */
+    if ((strstr(cmdline, "format") && strstr(cmdline, "userdata")) ||
+        (strstr(cmdline, "format") && strstr(cmdline, "data")) ||
+        strstr(cmdline, "make_ext4fs /dev/block") ||
+        strstr(cmdline, "mke2fs /dev/block")) {
+        return AB_RISK_FORMAT_DATA;
+    }
+
+    /* erase all / 全盘擦除 */
+    if (strstr(cmdline, "erase_all") ||
+        strstr(cmdline, "flash erase") ||
+        strstr(cmdline, "fastboot erase")) {
+        return AB_RISK_ERASE_ALL;
+    }
+
+    /* 破坏 OTA / 恢复分区 (ColorOS 特有) */
+    if (strstr(cmdline, "/dev/block/by-name/ota") ||
+        strstr(cmdline, "/dev/block/by-name/reserve") ||
+        strstr(cmdline, "dd of=/dev/block/by-name/boot") ||
+        strstr(cmdline, "dd of=/dev/block/by-name/recovery")) {
+        return AB_RISK_OTA_DESTROY;
+    }
+
+    /* 锁定 bootloader 命令 */
+    if (strstr(cmdline, "lock bootloader") ||
+        strstr(cmdline, "fastboot oem lock") ||
+        strstr(cmdline, "fastboot flashing lock") ||
+        strstr(cmdline, "lock_bootloader")) {
+        return AB_RISK_BOOTLOADER_LOCK;
+    }
+
+    /* ColorOS 恢复出厂特有命令 */
+    if (strstr(cmdline, "oppo_engine") && strstr(cmdline, "reset") ||
+        strstr(cmdline, "coloros") && strstr(cmdline, "wipe") ||
+        strstr(cmdline, "oneplus") && strstr(cmdline, "reset")) {
+        return AB_RISK_COLOROS_RESET;
+    }
+
+    /* 破坏性 fsck / 磁盘修复 */
+    if ((strstr(cmdline, "e2fsck") || strstr(cmdline, "fsck")) &&
+        (strstr(cmdline, "-y") || strstr(cmdline, "-f") ||
+         strstr(cmdline, "repair")) &&
+        strstr(cmdline, "/dev/block")) {
+        return AB_RISK_E2FSCK_BAD;
+    }
+
+    /* UFS 安全擦除 / purge */
+    if (strstr(cmdline, "secure_erase") ||
+        strstr(cmdline, "ufs purge") ||
+        strstr(cmdline, "blkdiscard /dev/block/sda") ||
+        strstr(cmdline, "blkdiscard /dev/block/by-name")) {
+        return AB_RISK_UFS_PURGE;
+    }
+
     return 0;
 }
 
@@ -185,6 +249,20 @@ static const char *ab_get_risk_reason(enum ab_risk_type type)
         return "检测到 fastboot 刷写命令";
     case AB_RISK_RECOVERY:
         return "检测到恢复出厂设置命令，将清除用户数据";
+    case AB_RISK_FORMAT_DATA:
+        return "检测到格式化用户数据分区，将删除所有个人数据";
+    case AB_RISK_ERASE_ALL:
+        return "检测到全盘擦除命令，将清除所有分区数据";
+    case AB_RISK_OTA_DESTROY:
+        return "检测到对系统/OTA分区的写入，可能破坏系统完整性";
+    case AB_RISK_BOOTLOADER_LOCK:
+        return "检测到锁定 bootloader 命令，可能导致设备变砖";
+    case AB_RISK_COLOROS_RESET:
+        return "检测到 ColorOS 恢复出厂操作";
+    case AB_RISK_E2FSCK_BAD:
+        return "检测到对块设备的强制 fsck，可能损坏文件系统";
+    case AB_RISK_UFS_PURGE:
+        return "检测到 UFS 安全擦除/全盘丢弃命令，将永久删除所有数据";
     default:
         return "未知高危操作";
     }
@@ -205,6 +283,13 @@ static const char *ab_get_risk_name(enum ab_risk_type type)
     case AB_RISK_FLASH:      return "FLASH";
     case AB_RISK_FASTBOOT:   return "FASTBOOT";
     case AB_RISK_RECOVERY:   return "RECOVERY";
+    case AB_RISK_FORMAT_DATA: return "FORMAT_DATA";
+    case AB_RISK_ERASE_ALL:  return "ERASE_ALL";
+    case AB_RISK_OTA_DESTROY: return "OTA_DESTROY";
+    case AB_RISK_BOOTLOADER_LOCK: return "BOOTLOADER_LOCK";
+    case AB_RISK_COLOROS_RESET: return "COLOROS_RESET";
+    case AB_RISK_E2FSCK_BAD: return "E2FSCK_BAD";
+    case AB_RISK_UFS_PURGE:  return "UFS_PURGE";
     default:                 return "UNKNOWN";
     }
 }

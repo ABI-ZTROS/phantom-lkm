@@ -22,19 +22,51 @@
 #define AUDIT_MAX_SHELL_ENTRIES     256     /* 最大Shell执行记录数 */
 #define AUDIT_MAX_PATH_LEN          512
 #define AUDIT_MAX_CMDLINE_LEN        1024
-#define AUDIT_MAX_PARTITIONS         16      /* 最大监控分区数 */
+#define AUDIT_MAX_PARTITIONS         64      /* 最大监控分区数 (一加/ColorOS分区多) */
 #define AUDIT_HASH_LEN               64      /* SHA256 hex长度 */
 
-/* 受保护的分区列表 */
+/* 受保护的分区列表 (一加 ACE5 / ColorOS 特有分区已补充) */
 static const char *protected_partitions[] = {
+    /* AOSP 标准分区 */
     "/system",
+    "/system_ext",
     "/vendor",
     "/product",
     "/odm",
+    "/odm_dlkm",
+    "/vendor_dlkm",
+    "/system_dlkm",
+    /* 引导相关 */
     "/boot",
     "/dtb",
+    "/dtbo",
     "/vbmeta",
+    "/vbmeta_system",
+    "/vbmeta_vendor",
     "/recovery",
+    "/ramdisk",
+    /* 用户数据 (防格机关键) */
+    "/data",
+    "/metadata",
+    "/misc",
+    /* 一加/OPPO/ColorOS 特有分区 */
+    "/op2",
+    "/oppo_product",
+    "/my_product",
+    "/my_engineering",
+    "/my_heytap",
+    "/my_stock",
+    "/my_region",
+    "/my_version",
+    "/my_carrier",
+    "/special_preload",
+    "/preload_common",
+    "/preload_heytap",
+    "/reserve",
+    /* DSP / 固件分区 */
+    "/dsp",
+    "/cdt",
+    "/xrom",
     NULL
 };
 
@@ -98,6 +130,7 @@ struct partition_policy {
     bool                enabled;              /* 分区保护总开关 */
     bool                auto_reject;          /* 自动拒绝写入 */
     bool                alert_only;           /* 仅告警不拦截 */
+    bool                auto_detect_ro_fs;    /* 自动检测只读文件系统并保护 */
     unsigned int        check_interval_sec;   /* 检查间隔（秒） */
 };
 
@@ -294,8 +327,117 @@ void shell_audit_clear(void)
 
 /* ==================== 分区保护 ==================== */
 
+/* ==================== 文件系统类型感知 (EROFS/dm-verity/UFS) ==================== */
+
+#include <linux/mount.h>
+#include <linux/fs.h>
+#include <linux/string.h>
+
+/**
+ * aurora_path_is_erofs - 检查路径所在文件系统是否为 EROFS (只读压缩文件系统)
+ *
+ * 一加 ACE5 的 system/vendor/product 等分区使用 EROFS 格式
+ * EROFS 本身就是只读的，写操作会被 VFS 层拒绝
+ */
+static bool aurora_path_is_erofs(const char *path)
+{
+    struct path p;
+    bool is_erofs = false;
+    int ret;
+
+    if (!path)
+        return false;
+
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0)
+        return false;
+
+    if (p.mnt && p.mnt->mnt_sb && p.mnt->mnt_sb->s_type) {
+        const char *fsname = p.mnt->mnt_sb->s_type->name;
+        if (fsname && strcmp(fsname, "erofs") == 0)
+            is_erofs = true;
+    }
+
+    path_put(&p);
+    return is_erofs;
+}
+
+/**
+ * aurora_path_is_dm_verity - 检查路径是否在 dm-verity 保护的分区上
+ *
+ * Android AVB 2.0 使用 dm-verity 保护系统分区
+ * dm-verity 分区写操作会被直接拒绝
+ */
+static bool aurora_path_is_dm_verity(const char *path)
+{
+    struct path p;
+    bool is_verity = false;
+    int ret;
+
+    if (!path)
+        return false;
+
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0)
+        return false;
+
+    if (p.mnt && p.mnt->mnt_sb) {
+        struct block_device *bdev = p.mnt->mnt_sb->s_bdev;
+        if (bdev && bdev->bd_disk) {
+            const char *disk_name = bdev->bd_disk->disk_name;
+            /* dm-verity 设备名通常是 dm-N 或 vroot */
+            if (disk_name && (strncmp(disk_name, "dm-", 3) == 0 ||
+                              strstr(disk_name, "verity") != NULL))
+                is_verity = true;
+        }
+    }
+
+    path_put(&p);
+    return is_verity;
+}
+
+/**
+ * aurora_path_is_readonly - 检查路径所在文件系统是否为只读
+ * 综合判断: EROFS + dm-verity + MS_RDONLY
+ */
+static bool aurora_path_is_readonly(const char *path)
+{
+    struct path p;
+    bool ro = false;
+    int ret;
+
+    if (!path)
+        return false;
+
+    ret = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (ret < 0)
+        return false;
+
+    if (p.mnt) {
+        /* 检查挂载标志 */
+        if (p.mnt->mnt_sb->s_flags & SB_RDONLY)
+            ro = true;
+
+        /* 检查文件系统类型 */
+        if (!ro && p.mnt->mnt_sb->s_type) {
+            const char *fsname = p.mnt->mnt_sb->s_type->name;
+            if (fsname && (strcmp(fsname, "erofs") == 0 ||
+                           strcmp(fsname, "squashfs") == 0))
+                ro = true;
+        }
+    }
+
+    path_put(&p);
+    return ro;
+}
+
 /**
  * partition_is_protected - 检查路径是否在受保护分区中
+ *
+ * 增强版: 除了静态分区列表，还会检查:
+ * - EROFS 只读文件系统
+ * - dm-verity 保护的分区
+ * - 只读挂载的文件系统
  */
 bool partition_is_protected(const char *path)
 {
@@ -304,6 +446,7 @@ bool partition_is_protected(const char *path)
     if (!part_policy.enabled || !path)
         return false;
 
+    /* 1. 检查动态监控的分区 */
     for (i = 0; i < partition_count; i++) {
         if (partitions[i].is_protected &&
             strncmp(path, partitions[i].mount_point,
@@ -311,12 +454,16 @@ bool partition_is_protected(const char *path)
             return true;
     }
 
-    /* 检查默认保护列表 */
+    /* 2. 检查静态保护列表 */
     for (i = 0; protected_partitions[i] != NULL; i++) {
         if (strncmp(path, protected_partitions[i],
                     strlen(protected_partitions[i])) == 0)
             return true;
     }
+
+    /* 3. 动态检测: 只读文件系统(EROFS/squashfs)自动视为受保护 */
+    if (part_policy.auto_detect_ro_fs && aurora_path_is_readonly(path))
+        return true;
 
     return false;
 }
@@ -380,11 +527,13 @@ int partition_get_status(char *buf, size_t size)
         "enabled: %d\n"
         "auto_reject: %d\n"
         "alert_only: %d\n"
+        "auto_detect_ro_fs: %d\n"
         "check_interval: %u\n"
         "---\n",
         part_policy.enabled ? 1 : 0,
         part_policy.auto_reject ? 1 : 0,
         part_policy.alert_only ? 1 : 0,
+        part_policy.auto_detect_ro_fs ? 1 : 0,
         part_policy.check_interval_sec);
 
     for (i = 0; i < partition_count; i++) {
@@ -405,16 +554,19 @@ int partition_get_status(char *buf, size_t size)
  */
 int partition_set_policy(const char *input)
 {
-    int enabled, auto_reject, alert_only, interval;
+    int enabled, auto_reject, alert_only, auto_ro, interval;
+    int n = sscanf(input, "%d:%d:%d:%d:%u", &enabled, &auto_reject,
+                   &alert_only, &auto_ro, &interval);
 
-    if (sscanf(input, "%d:%d:%d:%u", &enabled, &auto_reject,
-               &alert_only, &interval) != 4)
+    if (n < 4)
         return -EINVAL;
 
     mutex_lock(&part_mutex);
     part_policy.enabled = enabled ? true : false;
     part_policy.auto_reject = auto_reject ? true : false;
     part_policy.alert_only = alert_only ? true : false;
+    if (n >= 5)
+        part_policy.auto_detect_ro_fs = auto_ro ? true : false;
     part_policy.check_interval_sec = interval;
     mutex_unlock(&part_mutex);
 
@@ -558,10 +710,11 @@ int security_audit_init(void)
         partition_count++;
     }
 
-    /* 默认策略：启用保护，仅告警不拦截 */
+    /* 默认策略：启用保护，仅告警不拦截，自动检测只读文件系统 */
     part_policy.enabled = true;
     part_policy.auto_reject = false;
     part_policy.alert_only = true;
+    part_policy.auto_detect_ro_fs = true;
     part_policy.check_interval_sec = 300;
 
     /* 创建 sysfs 目录: /sys/kernel/ztrosu/audit/ */

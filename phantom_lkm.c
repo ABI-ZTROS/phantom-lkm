@@ -475,6 +475,81 @@ struct vfs_hook_target *vfs_hook_check(pid_t pid, uid_t uid, unsigned int *op_ma
     return NULL;
 }
 
+/* ==================== 快速路径缓存 (性能优化) ==================== */
+
+/*
+ * MGLRU 友好的快速路径:
+ *   - 每个 CPU 缓存最近一次 hook 检查结果
+ *   - 如果 UID/PID 命中缓存且规则数为 0 或 policy 默认 allow，直接放行
+ *   - 避免每次 VFS 操作都要遍历整个规则链表(加 mutex)
+ *
+ * 这对一加 ACE5 这种大核 + MGLRU 的设备特别重要：
+ *   - 8 个 CPU 核，per-cpu 缓存避免锁竞争
+ *   - MGLRU 下 VFS 操作很频繁，减少锁持有时间很关键
+ */
+
+struct fastpath_cache {
+    pid_t   last_pid;
+    uid_t   last_uid;
+    bool    last_hooked;     /* 上次是否在 hook 列表里 */
+    bool    last_allow;      /* 上次检查结果是否 allow */
+};
+
+static DEFINE_PER_CPU(struct fastpath_cache, fp_cache);
+
+/**
+ * vfs_fastpath_check - 快速路径检查
+ * @pid: 进程PID
+ * @uid: 进程UID
+ * @mode_mask: 操作类型
+ * @path: 文件路径
+ * @return: VFS_ACTION_ALLOW / VFS_ACTION_DENY / -1 (缓存未命中，走慢路径)
+ *
+ * 快速路径条件（全部满足才走）:
+ *   1. 当前 policy enabled (否则直接返回 allow)
+ *   2. 规则数为 0 且 default_action = ALLOW → 直接放行
+ *   3. UID 不在 hook 列表中 → 仅更新统计，不做规则检查(可选)
+ */
+static int vfs_fastpath_check(pid_t pid, uid_t uid, unsigned int mode_mask,
+                               const char *path)
+{
+    struct fastpath_cache *cache = this_cpu_ptr(&fp_cache);
+
+    /* 如果全局关闭，直接 allow */
+    if (!READ_ONCE(g_ctx.policy.enabled))
+        return VFS_ACTION_ALLOW;
+
+    /* 如果没有任何规则且默认动作是 allow，直接放行 (最常见场景) */
+    if (g_ctx.rules_count == 0 &&
+        READ_ONCE(g_ctx.policy.default_action) == VFS_ACTION_ALLOW) {
+        return VFS_ACTION_ALLOW;
+    }
+
+    /* UID 命中缓存且不在 hook 列表中 → 可以考虑直接放行，
+     * 但为了安全性，还是走完整规则检查
+     * (仅当规则数=0时才真正 fastpath)
+     */
+    if (cache->last_uid == uid && cache->last_pid == pid &&
+        !cache->last_hooked && g_ctx.rules_count == 0) {
+        return READ_ONCE(g_ctx.policy.default_action);
+    }
+
+    /* 缓存未命中或规则非空，走慢路径 */
+    return -1;
+}
+
+/**
+ * vfs_fastpath_update - 更新快速路径缓存
+ */
+static void vfs_fastpath_update(pid_t pid, uid_t uid, bool hooked, bool allow)
+{
+    struct fastpath_cache *cache = this_cpu_ptr(&fp_cache);
+    cache->last_pid = pid;
+    cache->last_uid = uid;
+    cache->last_hooked = hooked;
+    cache->last_allow = allow;
+}
+
 unsigned int vfs_hooks_clear(void)
 {
     struct vfs_hook_target *hook, *tmp;
@@ -939,6 +1014,100 @@ static int aurora_get_path_from_file(struct file *file, char *buf, size_t buflen
     return 0;
 }
 
+/* ==================== Android FUSE / 存储路径规范化 ==================== */
+
+/**
+ * aurora_normalize_storage_path - 规范化 Android 存储路径
+ *
+ * Android 存储路径有多种别名，规则匹配需要统一：
+ *   /sdcard/...                -> /data/media/0/...
+ *   /storage/emulated/0/...    -> /data/media/0/...
+ *   /mnt/sdcard/...            -> /data/media/0/...
+ *   /mnt/runtime/default/emulated/0/... -> /data/media/0/...
+ *   /mnt/runtime/read/emulated/0/...    -> /data/media/0/...
+ *   /mnt/runtime/write/emulated/0/...   -> /data/media/0/...
+ *   /mnt/user/0/emulated/0/... -> /data/media/0/...
+ *   /mnt/user/0/...            -> /data/user/0/... (应用私有目录)
+ *
+ * 注意: FUSE passthrough 模式下(Android 12+)，VFS 层拿到的可能是
+ *       底层真实路径(/data/media/0)，也可能是 FUSE 层路径(/storage/emulated/0)
+ */
+static void aurora_normalize_storage_path(char *path, size_t buflen)
+{
+    char tmp[VFS_MAX_PATH_LEN];
+    size_t len;
+
+    if (!path || !*path)
+        return;
+
+    len = strlen(path);
+    if (len >= VFS_MAX_PATH_LEN)
+        return;
+
+    strscpy(tmp, path, sizeof(tmp));
+
+    /* /sdcard/... -> /data/media/0/... */
+    if (strncmp(tmp, "/sdcard/", 8) == 0) {
+        snprintf(path, buflen, "/data/media/0/%s", tmp + 8);
+        return;
+    }
+    if (strcmp(tmp, "/sdcard") == 0) {
+        strscpy(path, "/data/media/0", buflen);
+        return;
+    }
+
+    /* /storage/emulated/0/... -> /data/media/0/... */
+    if (strncmp(tmp, "/storage/emulated/0/", 20) == 0) {
+        snprintf(path, buflen, "/data/media/0/%s", tmp + 20);
+        return;
+    }
+    if (strcmp(tmp, "/storage/emulated/0") == 0 ||
+        strcmp(tmp, "/storage/emulated") == 0) {
+        strscpy(path, "/data/media/0", buflen);
+        return;
+    }
+
+    /* /mnt/sdcard/... -> /data/media/0/... */
+    if (strncmp(tmp, "/mnt/sdcard/", 12) == 0) {
+        snprintf(path, buflen, "/data/media/0/%s", tmp + 12);
+        return;
+    }
+    if (strcmp(tmp, "/mnt/sdcard") == 0) {
+        strscpy(path, "/data/media/0", buflen);
+        return;
+    }
+
+    /* /mnt/runtime/{default,read,write,full}/emulated/0/... -> /data/media/0/... */
+    if (strncmp(tmp, "/mnt/runtime/", 13) == 0) {
+        const char *rest = tmp + 13;
+        /* 跳过 runtime 模式名 */
+        const char *slash = strchr(rest, '/');
+        if (slash) {
+            if (strncmp(slash, "/emulated/0/", 12) == 0) {
+                snprintf(path, buflen, "/data/media/0/%s", slash + 12);
+                return;
+            }
+            if (strcmp(slash, "/emulated/0") == 0 ||
+                strcmp(slash, "/emulated") == 0) {
+                strscpy(path, "/data/media/0", buflen);
+                return;
+            }
+        }
+    }
+
+    /* /mnt/user/0/emulated/0/... -> /data/media/0/... */
+    if (strncmp(tmp, "/mnt/user/0/emulated/0/", 23) == 0) {
+        snprintf(path, buflen, "/data/media/0/%s", tmp + 23);
+        return;
+    }
+
+    /* /mnt/user/0/... -> /data/user/0/... (应用私有目录) */
+    if (strncmp(tmp, "/mnt/user/0/", 12) == 0) {
+        snprintf(path, buflen, "/data/user/0/%s", tmp + 12);
+        return;
+    }
+}
+
 /* 辅助函数：判断 mask 是否为写操作 */
 static bool aurora_mask_is_write(int mask)
 {
@@ -974,6 +1143,9 @@ static int aurora_security_file_open(struct file *file)
     /* 获取文件路径 */
     if (aurora_get_path_from_file(file, path_buf, sizeof(path_buf)) != 0)
         return 0;
+
+    /* 规范化 Android 存储路径 (FUSE/sdcard 别名处理) */
+    aurora_normalize_storage_path(path_buf, sizeof(path_buf));
 
     /* 检查当前进程是否在Hook列表中 */
     hook = vfs_hook_check(pid, uid, &hook_mode);
@@ -1040,6 +1212,9 @@ static int aurora_security_file_permission(struct file *file, int mask)
     /* 获取文件路径 */
     if (aurora_get_path_from_file(file, path_buf, sizeof(path_buf)) != 0)
         return 0;
+
+    /* 规范化 Android 存储路径 (FUSE/sdcard 别名处理) */
+    aurora_normalize_storage_path(path_buf, sizeof(path_buf));
 
     /* 判断操作类型 */
     if (aurora_mask_is_read(mask))
