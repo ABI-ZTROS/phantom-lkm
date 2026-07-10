@@ -1161,7 +1161,16 @@ static int aurora_security_file_open(struct file *file)
         if (mode_mask == 0)
             return 0;
 
-        /* 规则引擎检查 */
+        /* 快速路径: 规则数为0且默认allow时直接放行 */
+        {
+            int fp = vfs_fastpath_check(pid, uid, mode_mask, path_buf);
+            if (fp >= 0 && fp == VFS_ACTION_ALLOW) {
+                vfs_stats_update(0); /* open */
+                return 0;
+            }
+        }
+
+        /* 规则引擎检查 (慢路径) */
         action = vfs_rules_check(path_buf, mode_mask);
     }
 
@@ -1225,7 +1234,20 @@ static int aurora_security_file_permission(struct file *file, int mask)
     if (mode_mask == 0)
         return 0;
 
-    /* 规则引擎检查 */
+    /* 快速路径: 规则数为0且默认allow时直接放行，避免锁开销 */
+    {
+        int fp = vfs_fastpath_check(pid, uid, mode_mask, path_buf);
+        if (fp >= 0) {
+            /* fastpath 命中，只更新统计 */
+            if (mode_mask & VFS_OP_READ)
+                vfs_stats_update(1);
+            if (mode_mask & VFS_OP_WRITE)
+                vfs_stats_update(2);
+            return 0;
+        }
+    }
+
+    /* 规则引擎检查 (慢路径) */
     action = vfs_rules_check(path_buf, mode_mask);
     if (action == VFS_ACTION_DENY) {
         vfs_stats_update(4); /* denied */

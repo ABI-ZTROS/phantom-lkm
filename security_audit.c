@@ -334,71 +334,17 @@ void shell_audit_clear(void)
 #include <linux/string.h>
 
 /**
- * aurora_path_is_erofs - 检查路径所在文件系统是否为 EROFS (只读压缩文件系统)
+ * aurora_path_is_readonly - 检查路径所在文件系统是否为只读
+ *
+ * 综合判断:
+ *   1. SB_RDONLY 挂载标志
+ *   2. EROFS / squashfs 等只读文件系统类型
  *
  * 一加 ACE5 的 system/vendor/product 等分区使用 EROFS 格式
- * EROFS 本身就是只读的，写操作会被 VFS 层拒绝
- */
-static bool aurora_path_is_erofs(const char *path)
-{
-    struct path p;
-    bool is_erofs = false;
-    int ret;
-
-    if (!path)
-        return false;
-
-    ret = kern_path(path, LOOKUP_FOLLOW, &p);
-    if (ret < 0)
-        return false;
-
-    if (p.mnt && p.mnt->mnt_sb && p.mnt->mnt_sb->s_type) {
-        const char *fsname = p.mnt->mnt_sb->s_type->name;
-        if (fsname && strcmp(fsname, "erofs") == 0)
-            is_erofs = true;
-    }
-
-    path_put(&p);
-    return is_erofs;
-}
-
-/**
- * aurora_path_is_dm_verity - 检查路径是否在 dm-verity 保护的分区上
+ * EROFS + dm-verity 组合下，写操作会被 VFS 层直接拒绝
  *
- * Android AVB 2.0 使用 dm-verity 保护系统分区
- * dm-verity 分区写操作会被直接拒绝
- */
-static bool aurora_path_is_dm_verity(const char *path)
-{
-    struct path p;
-    bool is_verity = false;
-    int ret;
-
-    if (!path)
-        return false;
-
-    ret = kern_path(path, LOOKUP_FOLLOW, &p);
-    if (ret < 0)
-        return false;
-
-    if (p.mnt && p.mnt->mnt_sb) {
-        struct block_device *bdev = p.mnt->mnt_sb->s_bdev;
-        if (bdev && bdev->bd_disk) {
-            const char *disk_name = bdev->bd_disk->disk_name;
-            /* dm-verity 设备名通常是 dm-N 或 vroot */
-            if (disk_name && (strncmp(disk_name, "dm-", 3) == 0 ||
-                              strstr(disk_name, "verity") != NULL))
-                is_verity = true;
-        }
-    }
-
-    path_put(&p);
-    return is_verity;
-}
-
-/**
- * aurora_path_is_readonly - 检查路径所在文件系统是否为只读
- * 综合判断: EROFS + dm-verity + MS_RDONLY
+ * 注意: 不通过 bd_disk 判断 dm-verity 设备名（GKI DDK 不导出完整 gendisk），
+ *       只读文件系统类型 + SB_RDONLY 标志已经足够判断
  */
 static bool aurora_path_is_readonly(const char *path)
 {
@@ -413,12 +359,13 @@ static bool aurora_path_is_readonly(const char *path)
     if (ret < 0)
         return false;
 
-    if (p.mnt) {
-        /* 检查挂载标志 */
-        if (p.mnt->mnt_sb->s_flags & SB_RDONLY)
+    if (p.mnt && p.mnt->mnt_sb) {
+        /* 1. 检查挂载标志 */
+        if (p.mnt->mnt_sb->s_flags & SB_RDONLY) {
             ro = true;
+        }
 
-        /* 检查文件系统类型 */
+        /* 2. 检查文件系统类型 (EROFS/squashfs 是只读文件系统) */
         if (!ro && p.mnt->mnt_sb->s_type) {
             const char *fsname = p.mnt->mnt_sb->s_type->name;
             if (fsname && (strcmp(fsname, "erofs") == 0 ||
