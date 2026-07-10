@@ -38,10 +38,10 @@ struct event_record {
     __u32 result;
 };
 
-/* 事件环形缓冲区 */
-static struct event_record event_ring[EVENT_RING_SIZE];
-static atomic_t event_head;
-static spinlock_t event_lock;
+/* 事件环形缓冲区 (ioctl.c 也会引用) */
+struct event_record event_ring[EVENT_RING_SIZE];
+atomic_t event_head;
+spinlock_t event_lock;
 
 /* ==================== 事件写入 ==================== */
 

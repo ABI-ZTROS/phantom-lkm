@@ -85,50 +85,71 @@ int vfs_stats_get_string(char *buf, size_t size)
 /* ==================== 规则引擎实现 ==================== */
 
 /* glob匹配 - 支持 * ? ** */
+/* 动态规划迭代实现，避免内核栈溢出 */
 static bool glob_match(const char *pattern, const char *path)
 {
-    /* 简化实现: 仅支持 * 和 ** */
-    const char *p = pattern, *s = path;
-    
-    while (*p && *s) {
-        if (*p == '*') {
-            /* 检查是否是 ** (匹配任意字符含/) */
-            if (p[1] == '*') {
-                p += 2;
-                /* ** 匹配剩余所有字符 */
-                if (!*p) return true;
-                /* 递归匹配 */
-                while (*s) {
-                    if (glob_match(p, s)) return true;
-                    s++;
-                }
-                return false;
-            } else {
-                /* * 匹配非/字符 */
-                p++;
-                while (*s && *s != '/') {
-                    if (glob_match(p, s)) return true;
-                    s++;
-                }
+    int plen = strlen(pattern);
+    int slen = strlen(path);
+    bool *prev, *curr, *tmp;
+    bool result = false;
+    int i, j;
+
+    if (plen == 0 && slen == 0)
+        return true;
+
+    prev = kcalloc(slen + 1, sizeof(bool), GFP_KERNEL);
+    if (!prev)
+        return false;
+    curr = kcalloc(slen + 1, sizeof(bool), GFP_KERNEL);
+    if (!curr) {
+        kfree(prev);
+        return false;
+    }
+
+    prev[0] = true;
+
+    for (i = 1; i <= plen; i++) {
+        memset(curr, 0, (slen + 1) * sizeof(bool));
+
+        if (pattern[i - 1] == '*') {
+            if (i >= 2 && pattern[i - 2] == '*') {
+                /* ** 匹配任意字符 (含 /) */
+                curr[0] = prev[0];
+                for (j = 1; j <= slen; j++)
+                    curr[j] = prev[j] || curr[j - 1];
                 continue;
             }
-        } else if (*p == '?') {
-            /* ? 匹配单个非/字符 */
-            p++;
-            if (*s == '/') return false;
-            s++;
-        } else if (*p == *s) {
-            p++;
-            s++;
+            /* * 匹配非 / 字符 */
+            curr[0] = prev[0];
+            for (j = 1; j <= slen; j++) {
+                if (path[j - 1] == '/')
+                    curr[j] = false;
+                else
+                    curr[j] = prev[j] || curr[j - 1];
+            }
+        } else if (pattern[i - 1] == '?') {
+            /* ? 匹配单个非 / 字符 */
+            for (j = 1; j <= slen; j++) {
+                if (path[j - 1] != '/')
+                    curr[j] = prev[j - 1];
+            }
         } else {
-            return false;
+            /* 普通字符精确匹配 */
+            for (j = 1; j <= slen; j++) {
+                curr[j] = (pattern[i - 1] == path[j - 1]) && prev[j - 1];
+            }
         }
+
+        tmp = prev;
+        prev = curr;
+        curr = tmp;
     }
-    
-    /* 处理末尾 * */
-    while (*p == '*') p++;
-    
-    return !*p && !*s;
+
+    result = prev[slen];
+
+    kfree(prev);
+    kfree(curr);
+    return result;
 }
 
 struct vfs_rule *vfs_rule_parse(const char *rule_str)
@@ -409,29 +430,47 @@ int vfs_hook_remove(enum vfs_hook_type type, const char *identifier)
     return -ENOENT;
 }
 
-struct vfs_hook_target *vfs_hook_check(pid_t pid, uid_t uid, unsigned int *mode_mask)
+struct vfs_hook_target *vfs_hook_check(pid_t pid, uid_t uid, unsigned int *op_mask)
 {
     struct vfs_hook_target *hook;
-    
+
     mutex_lock(&g_ctx.hooks_mutex);
-    
+
     list_for_each_entry(hook, &g_ctx.hooks, list) {
         if (!hook->enabled)
             continue;
-        
+
         if (hook->type == VFS_HOOK_PID && hook->pid == pid) {
-            *mode_mask = hook->mode;
+            if (op_mask) {
+                unsigned int mask = 0;
+                if (hook->mode == VFS_HOOK_INTERCEPT_READ ||
+                    hook->mode == VFS_HOOK_INTERCEPT_ALL)
+                    mask |= VFS_OP_READ;
+                if (hook->mode == VFS_HOOK_INTERCEPT_WRITE ||
+                    hook->mode == VFS_HOOK_INTERCEPT_ALL)
+                    mask |= VFS_OP_WRITE;
+                *op_mask = mask;
+            }
             mutex_unlock(&g_ctx.hooks_mutex);
             return hook;
         }
-        
+
         if (hook->type == VFS_HOOK_PACKAGE && hook->uid == uid) {
-            *mode_mask = hook->mode;
+            if (op_mask) {
+                unsigned int mask = 0;
+                if (hook->mode == VFS_HOOK_INTERCEPT_READ ||
+                    hook->mode == VFS_HOOK_INTERCEPT_ALL)
+                    mask |= VFS_OP_READ;
+                if (hook->mode == VFS_HOOK_INTERCEPT_WRITE ||
+                    hook->mode == VFS_HOOK_INTERCEPT_ALL)
+                    mask |= VFS_OP_WRITE;
+                *op_mask = mask;
+            }
             mutex_unlock(&g_ctx.hooks_mutex);
             return hook;
         }
     }
-    
+
     mutex_unlock(&g_ctx.hooks_mutex);
     return NULL;
 }
@@ -490,7 +529,7 @@ static ssize_t enabled_store(struct kobject *kobj, struct kobj_attribute *attr,
     if (ret)
         return ret;
     
-    g_ctx.policy.enabled = val;
+    WRITE_ONCE(g_ctx.policy.enabled, val);
     vfs_trace("enabled set to %d", val);
     return count;
 }
@@ -929,7 +968,7 @@ static int aurora_security_file_open(struct file *file)
     pid_t pid = current->pid;
     uid_t uid = __kuid_val(current_uid());
 
-    if (!g_ctx.policy.enabled)
+    if (!READ_ONCE(g_ctx.policy.enabled))
         return 0;
 
     /* 获取文件路径 */
@@ -939,8 +978,20 @@ static int aurora_security_file_open(struct file *file)
     /* 检查当前进程是否在Hook列表中 */
     hook = vfs_hook_check(pid, uid, &hook_mode);
 
-    /* 规则引擎检查 */
-    action = vfs_rules_check(path_buf, VFS_OP_READ | VFS_OP_WRITE);
+    /* 根据文件标志确定操作类型 */
+    {
+        unsigned int mode_mask = 0;
+        int f_flags = file->f_flags;
+        if ((f_flags & O_ACCMODE) == O_RDONLY || (f_flags & O_ACCMODE) == O_RDWR)
+            mode_mask |= VFS_OP_READ;
+        if ((f_flags & O_ACCMODE) == O_WRONLY || (f_flags & O_ACCMODE) == O_RDWR)
+            mode_mask |= VFS_OP_WRITE;
+        if (mode_mask == 0)
+            return 0;
+
+        /* 规则引擎检查 */
+        action = vfs_rules_check(path_buf, mode_mask);
+    }
 
     if (action == VFS_ACTION_DENY) {
         vfs_stats_update(4); /* denied */
@@ -983,7 +1034,7 @@ static int aurora_security_file_permission(struct file *file, int mask)
     uid_t uid = __kuid_val(current_uid());
     unsigned int mode_mask = 0;
 
-    if (!g_ctx.policy.enabled)
+    if (!READ_ONCE(g_ctx.policy.enabled))
         return 0;
 
     /* 获取文件路径 */
@@ -1047,7 +1098,7 @@ static int aurora_security_bprm_check(struct linux_binprm *bprm)
     int ret;
     const char *interp = NULL;
 
-    if (!g_ctx.policy.enabled)
+    if (!READ_ONCE(g_ctx.policy.enabled))
         return 0;
 
     /* 防格机检查 */
@@ -1267,7 +1318,7 @@ static int __init aurora_vfs_init(void)
     vfs_stats_init();
     
     /* 初始化策略 */
-    g_ctx.policy.enabled = false;
+    WRITE_ONCE(g_ctx.policy.enabled, false);
     g_ctx.policy.log_level = 0;
     g_ctx.policy.default_action = VFS_ACTION_ALLOW;
     

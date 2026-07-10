@@ -91,7 +91,7 @@ static long ioc_get_policy(struct aurora_ioc_policy __user *upol)
     struct aurora_ioc_policy pol;
 
     memset(&pol, 0, sizeof(pol));
-    pol.enabled        = g_ctx.policy.enabled ? 1 : 0;
+    pol.enabled        = READ_ONCE(g_ctx.policy.enabled) ? 1 : 0;
     pol.log_level      = (u8)g_ctx.policy.log_level;
     pol.default_action = (g_ctx.policy.default_action == VFS_ACTION_DENY) ? 1 : 0;
 
@@ -118,8 +118,8 @@ static long ioc_set_policy(struct aurora_ioc_policy __user *upol)
     if (pol.default_action != 0 && pol.default_action != 1)
         return -EINVAL;
 
-    g_ctx.policy.enabled        = pol.enabled;
-    g_ctx.policy.log_level      = pol.log_level;
+    WRITE_ONCE(g_ctx.policy.enabled, pol.enabled);
+    WRITE_ONCE(g_ctx.policy.log_level, pol.log_level);
     g_ctx.policy.default_action = pol.default_action ? VFS_ACTION_DENY : VFS_ACTION_ALLOW;
 
     vfs_trace("ioctl: policy set enabled=%u, log_level=%u, default_action=%u",

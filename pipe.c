@@ -411,9 +411,9 @@ static int pipe_cmd_set_policy(void *data, size_t len)
     }
 
     /* 应用策略 */
-    g_ctx.policy.enabled = cmd->enabled;
-    g_ctx.policy.log_level = cmd->log_level;
-    g_ctx.policy.default_action = cmd->default_action;
+    WRITE_ONCE(g_ctx.policy.enabled, cmd->enabled);
+    WRITE_ONCE(g_ctx.policy.log_level, cmd->log_level);
+    WRITE_ONCE(g_ctx.policy.default_action, cmd->default_action);
 
     vfs_trace("pipe: set_policy enabled=%u, log_level=%u, default_action=%u",
               cmd->enabled, cmd->log_level, cmd->default_action);
